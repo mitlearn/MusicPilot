@@ -1,0 +1,14 @@
+services:
+  musicpilot:
+    build: .
+    container_name: musicpilot
+    environment:
+      MP_DATABASE_URL: sqlite+aiosqlite:////data/musicpilot.db
+      MP_MUSIC_LIBRARY_PATH: /music
+      MP_DOWNLOAD_STAGING_PATH: /downloads
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - ./data/library:/music
+      - ./data/downloads:/downloads

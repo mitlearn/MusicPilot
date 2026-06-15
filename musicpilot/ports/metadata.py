@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class TrackMetadata:
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    year: int | None = None
+    track_number: int | None = None
+    lyrics: str | None = None
+    cover_url: str | None = None
+    extra: dict[str, str] = field(default_factory=dict)
+
+
+class MetadataProvider(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    async def lookup(self, *, title: str, artist: str | None = None) -> TrackMetadata | None: ...
