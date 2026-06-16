@@ -20,6 +20,14 @@ class DownloadStatus:
     state: DownloadState
     progress: float
     save_path: Path | None = None
+    content_path: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TorrentFile:
+    path: Path
+    size: int = 0
+    progress: float = 0.0
 
 
 class Downloader(Protocol):
@@ -37,3 +45,5 @@ class Downloader(Protocol):
     ) -> str: ...
 
     async def get_status(self, torrent_hash: str) -> DownloadStatus: ...
+
+    async def list_files(self, torrent_hash: str) -> tuple[TorrentFile, ...]: ...

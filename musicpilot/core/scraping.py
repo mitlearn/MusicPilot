@@ -50,6 +50,9 @@ class ScrapingFileResult:
     metadata: TrackMetadata
     status: Literal["success", "failed"]
     error_message: str | None = None
+    stage: str = "completed"
+    needs_metadata_update: bool = False
+    candidate_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,17 @@ class ScrapingSummary:
     moved_files: int = 0
     failed_files: int = 0
     results: tuple[ScrapingFileResult, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchScore:
+    title: int = 0
+    artist: int = 0
+    album: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.title + self.artist + self.album
 
 
 class LocalMusicScraper:
@@ -78,18 +92,23 @@ class LocalMusicScraper:
         task_name: str,
         save_path: str | None,
         config: ScrapingConfig,
+        source_files: tuple[Path, ...] | None = None,
     ) -> ScrapingSummary:
         if not config.enabled:
             return ScrapingSummary()
-        source_files = await asyncio.to_thread(_download_audio_files, task_name, save_path)
-        if not source_files:
+        audio_files = (
+            await asyncio.to_thread(_download_audio_files, task_name, save_path)
+            if source_files is None
+            else await asyncio.to_thread(_input_audio_files, source_files)
+        )
+        if not audio_files:
             return ScrapingSummary()
 
         mapped_files = 0
         updated_files = 0
         moved_files = 0
         results: list[ScrapingFileResult] = []
-        for source_file in source_files:
+        for source_file in audio_files:
             try:
                 result, mapped, updated, moved = await self._process_file(source_file, config)
             except Exception as exc:
@@ -103,6 +122,7 @@ class LocalMusicScraper:
                     metadata=source_metadata,
                     status="failed",
                     error_message=str(exc) or exc.__class__.__name__,
+                    stage=exc.__class__.__name__,
                 )
                 mapped = updated = moved = 0
             results.append(result)
@@ -111,7 +131,7 @@ class LocalMusicScraper:
             moved_files += moved
 
         return ScrapingSummary(
-            source_files=len(source_files),
+            source_files=len(audio_files),
             mapped_files=mapped_files,
             updated_files=updated_files,
             moved_files=moved_files,
@@ -129,16 +149,16 @@ class LocalMusicScraper:
         updated_files = 0
         moved_files = 0
         source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
+        match_metadata = _metadata_for_matching(source_metadata, source_file)
         needs_update = _metadata_missing(source_metadata, config.required_metadata)
-        metadata = source_metadata
+        metadata = _merge_metadata(source_metadata, match_metadata)
+        candidate_count = 0
+        tag_writer = self.tag_writer
         if needs_update:
-            candidates = await self.metadata.search_metadata(
-                title=source_metadata.title,
-                artist=source_metadata.artist,
-                limit=8,
-            )
+            candidates = await self._search_metadata_candidates(source_metadata, match_metadata)
+            candidate_count = len(candidates)
             looked_up = _select_metadata_candidate(
-                source_metadata,
+                match_metadata,
                 candidates,
                 config.required_metadata,
             )
@@ -149,13 +169,20 @@ class LocalMusicScraper:
                         library_path=None,
                         metadata=source_metadata,
                         status="failed",
-                        error_message="未找到可信的刮削候选。",
+                        error_message=_candidate_failure_message(
+                            match_metadata,
+                            config.required_metadata,
+                            candidates,
+                        ),
+                        stage="metadata_candidate",
+                        needs_metadata_update=needs_update,
+                        candidate_count=candidate_count,
                     ),
                     0,
                     0,
                     0,
                 )
-            if self.tag_writer is None:
+            if tag_writer is None:
                 return (
                     ScrapingFileResult(
                         source_path=source_file,
@@ -163,12 +190,15 @@ class LocalMusicScraper:
                         metadata=source_metadata,
                         status="failed",
                         error_message="标签写入器不可用。",
+                        stage="tag_writer",
+                        needs_metadata_update=needs_update,
+                        candidate_count=candidate_count,
                     ),
                     0,
                     0,
                     0,
                 )
-            metadata = _merge_metadata(source_metadata, looked_up)
+            metadata = _merge_metadata(metadata, looked_up)
 
         if config.mode == "mapped":
             working_file = await asyncio.to_thread(
@@ -188,7 +218,8 @@ class LocalMusicScraper:
             mapped_files += 1
 
         if needs_update:
-            await self.tag_writer.write(working_file, metadata)
+            assert tag_writer is not None
+            await tag_writer.write(working_file, metadata)
             updated_files += 1
 
         final_file = await asyncio.to_thread(
@@ -205,11 +236,43 @@ class LocalMusicScraper:
                 library_path=final_file,
                 metadata=metadata,
                 status="success",
+                needs_metadata_update=needs_update,
+                candidate_count=candidate_count,
             ),
             mapped_files,
             updated_files,
             moved_files,
         )
+
+    async def _search_metadata_candidates(
+        self,
+        source_metadata: TrackMetadata,
+        match_metadata: TrackMetadata,
+    ) -> tuple[TrackMetadata, ...]:
+        searches = [
+            (match_metadata.title, match_metadata.artist),
+            (source_metadata.title, source_metadata.artist),
+        ]
+        candidates: list[TrackMetadata] = []
+        seen: set[tuple[str, str, str]] = set()
+        for title, artist in searches:
+            if not title:
+                continue
+            for candidate in await self.metadata.search_metadata(
+                title=title,
+                artist=artist,
+                limit=8,
+            ):
+                key = (
+                    _normalize_match_text(candidate.title),
+                    _normalize_match_text(candidate.artist),
+                    _normalize_match_text(candidate.album),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(candidate)
+        return tuple(candidates)
 
 
 def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
@@ -280,6 +343,21 @@ def _download_audio_files(task_name: str, save_path: str | None) -> list[Path]:
     return files
 
 
+def _input_audio_files(source_files: tuple[Path, ...]) -> list[Path]:
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for source_file in source_files:
+        path = source_file.expanduser()
+        if not path.is_file() or path.suffix.casefold() not in _AUDIO_EXTENSIONS:
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        files.append(resolved)
+    return files
+
+
 def _audio_files(path: Path) -> list[Path]:
     if path.is_file() and path.suffix.casefold() in _AUDIO_EXTENSIONS:
         return [path]
@@ -343,22 +421,51 @@ def _metadata_missing(metadata: TrackMetadata, required: tuple[RequiredMetadata,
     return False
 
 
+def _metadata_for_matching(metadata: TrackMetadata, source_file: Path) -> TrackMetadata:
+    if metadata.artist:
+        return metadata
+    parsed = _parse_artist_title(metadata.title) or _parse_artist_title(source_file.stem)
+    if parsed is None:
+        return metadata
+    artist, title = parsed
+    return TrackMetadata(
+        title=title,
+        artist=artist,
+        album=metadata.album,
+        year=metadata.year,
+        track_number=metadata.track_number,
+        lyrics=metadata.lyrics,
+        cover_url=metadata.cover_url,
+        extra=metadata.extra,
+    )
+
+
+def _parse_artist_title(value: str | None) -> tuple[str, str] | None:
+    if not value:
+        return None
+    text = _strip_track_prefix(value)
+    for delimiter in (" - ", " – ", " — ", "-", "–", "—"):
+        if delimiter not in text:
+            continue
+        left, right = (part.strip() for part in text.split(delimiter, 1))
+        if len(left) >= 1 and len(right) >= 1:
+            return left, right
+    return None
+
+
+def _strip_track_prefix(value: str) -> str:
+    return re.sub(r"^\s*(?:cd\s*)?\d{1,3}(?:[.\-_、\s]+)", "", value, flags=re.I).strip()
+
+
 def _select_metadata_candidate(
     existing: TrackMetadata,
     candidates: tuple[TrackMetadata, ...],
     required: tuple[RequiredMetadata, ...],
 ) -> TrackMetadata | None:
-    ranked: list[tuple[int, TrackMetadata]] = []
     for candidate in candidates:
-        if not _candidate_fills_required(existing, candidate, required):
-            continue
-        score = _metadata_match_score(existing, candidate)
-        if score >= 4:
-            ranked.append((score, candidate))
-    if not ranked:
-        return None
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return ranked[0][1]
+        if _candidate_fills_required(existing, candidate, required):
+            return candidate
+    return None
 
 
 def _candidate_fills_required(
@@ -376,35 +483,70 @@ def _candidate_fills_required(
     return True
 
 
-def _metadata_match_score(existing: TrackMetadata, scraped: TrackMetadata) -> int:
-    existing_title = _normalize_match_text(existing.title)
-    scraped_title = _normalize_match_text(scraped.title)
-    if not existing_title or not scraped_title:
+def _candidate_failure_message(
+    metadata: TrackMetadata,
+    required: tuple[RequiredMetadata, ...],
+    candidates: tuple[TrackMetadata, ...],
+) -> str:
+    required_text = ", ".join(required) if required else "none"
+    score_text = _best_candidate_score_text(metadata, candidates)
+    return (
+        "未找到可信的刮削候选。"
+        f"title={metadata.title!r}, artist={metadata.artist!r}, "
+        f"required={required_text}, candidates={len(candidates)}"
+        f"{score_text}"
+    )
+
+
+def _best_candidate_score_text(
+    metadata: TrackMetadata,
+    candidates: tuple[TrackMetadata, ...],
+) -> str:
+    best_candidate = None
+    best_score = _MatchScore()
+    for candidate in candidates:
+        score = _metadata_match_score(metadata, candidate)
+        if score.total > best_score.total:
+            best_candidate = candidate
+            best_score = score
+    if best_candidate is None:
+        return ""
+    return (
+        f", best={best_candidate.title!r}/{best_candidate.artist!r}/"
+        f"{best_candidate.album!r}, score={best_score.total}"
+        f"(title={best_score.title}, artist={best_score.artist}, album={best_score.album})"
+    )
+
+
+def _metadata_match_score(existing: TrackMetadata, scraped: TrackMetadata) -> _MatchScore:
+    title_score = _match_score(existing.title, scraped.title)
+    artist_score = _match_artist(existing.artist or existing.title, scraped.artist)
+    album_score = _match_score(existing.album or existing.title, scraped.album)
+    if existing.artist and artist_score == 0:
+        artist_score = -2
+    if not existing.artist and artist_score >= 1 and title_score >= 1:
+        title_score = 2
+    if title_score == 0:
+        return _MatchScore(title=0, artist=artist_score, album=album_score)
+    return _MatchScore(title=title_score, artist=artist_score, album=album_score)
+
+
+def _match_score(left: str | None, right: str | None) -> int:
+    left_normalized = _normalize_match_text(left)
+    right_normalized = _normalize_match_text(right)
+    if not left_normalized or not right_normalized:
         return 0
-    if existing_title != scraped_title:
+    if left_normalized == right_normalized:
+        return 2
+    if left_normalized in right_normalized or right_normalized in left_normalized:
+        return 1
+    return 0
+
+
+def _match_artist(left: str | None, right: str | None) -> int:
+    if not right:
         return 0
-    score = 4
-    if existing.artist and scraped.artist:
-        existing_artist = _normalize_match_text(existing.artist)
-        scraped_artist = _normalize_match_text(scraped.artist)
-        if (
-            existing_artist
-            and scraped_artist
-            and existing_artist not in scraped_artist
-            and scraped_artist not in existing_artist
-        ):
-            return 0
-        score += 2
-    if existing.album and scraped.album:
-        existing_album = _normalize_match_text(existing.album)
-        scraped_album = _normalize_match_text(scraped.album)
-        if existing_album and scraped_album and existing_album == scraped_album:
-            score += 1
-    if scraped.lyrics:
-        score += 1
-    if scraped.cover_url:
-        score += 1
-    return score
+    return max(_match_score(left, item) for item in re.split(r"[,，、/&]+", right))
 
 
 def _normalize_match_text(value: str | None) -> str:

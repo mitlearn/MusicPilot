@@ -32,9 +32,11 @@ def _write_tags_sync(
         return
 
     _set_tag(audio, "title", metadata.title)
-    _set_tag(audio, "artist", metadata.artist)
+    _set_tag(audio, "artist", metadata.artist, split_commas=True)
     _set_tag(audio, "album", metadata.album)
-    _set_tag(audio, "date", str(metadata.year) if metadata.year is not None else None)
+    year = str(metadata.year) if metadata.year is not None else None
+    _set_tag(audio, "date", year)
+    _set_tag(audio, "year", year)
     _set_tag(
         audio,
         "tracknumber",
@@ -49,10 +51,21 @@ def _write_tags_sync(
         _write_cover_sync(path, cover[0], cover[1])
 
 
-def _set_tag(audio: object, key: str, value: str | None) -> None:
+def _set_tag(
+    audio: object,
+    key: str,
+    value: str | None,
+    *,
+    split_commas: bool = False,
+) -> None:
     if value:
         try:
-            audio[key] = [value]
+            values = (
+                [item.strip() for item in value.split(",") if item.strip()]
+                if split_commas
+                else [value]
+            )
+            audio[key] = values
         except Exception:
             return
 

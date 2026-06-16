@@ -6,7 +6,7 @@ from pathlib import Path
 
 import httpx
 
-from musicpilot.ports.downloader import DownloadState, DownloadStatus
+from musicpilot.ports.downloader import DownloadState, DownloadStatus, TorrentFile
 
 
 class QBittorrentAuthError(RuntimeError):
@@ -93,7 +93,7 @@ class QBittorrentClient:
             if len(new_items) == 1:
                 return str(new_items[0].get("hash", ""))
             if len(new_items) > 1:
-                newest = max(new_items, key=lambda item: int(item.get("added_on") or 0))
+                newest = max(new_items, key=lambda item: _optional_int(item.get("added_on")))
                 return str(newest.get("hash", ""))
             await asyncio.sleep(1)
         return ""
@@ -136,7 +136,7 @@ class QBittorrentClient:
             if len(new_items) == 1:
                 return str(new_items[0].get("hash", ""))
             if len(new_items) > 1:
-                newest = max(new_items, key=lambda item: int(item.get("added_on") or 0))
+                newest = max(new_items, key=lambda item: _optional_int(item.get("added_on")))
                 return str(newest.get("hash", ""))
             await asyncio.sleep(1)
         raise RuntimeError("qBittorrent did not add the uploaded torrent.")
@@ -152,19 +152,30 @@ class QBittorrentClient:
         if not items:
             return DownloadStatus(torrent_hash, "", DownloadState.FAILED, 0.0)
         item = items[0]
-        progress = float(item.get("progress", 0.0))
+        progress = _optional_float(item.get("progress"))
         state = DownloadState.COMPLETED if progress >= 1 else DownloadState.DOWNLOADING
         save_path = item.get("save_path")
+        content_path = item.get("content_path")
         return DownloadStatus(
             torrent_hash=torrent_hash,
             name=str(item.get("name", "")),
             state=state,
             progress=progress,
             save_path=Path(save_path) if save_path else None,
+            content_path=Path(str(content_path)) if content_path else None,
         )
 
     async def list_statuses(self) -> tuple[DownloadStatus, ...]:
         return tuple(_status_from_item(item) for item in await self._list_info())
+
+    async def list_files(self, torrent_hash: str) -> tuple[TorrentFile, ...]:
+        response = await self._request(
+            "GET",
+            "/api/v2/torrents/files",
+            params={"hash": torrent_hash},
+        )
+        response.raise_for_status()
+        return tuple(_file_from_item(item) for item in response.json())
 
     async def _list_info(self) -> list[dict[str, object]]:
         response = await self._request("GET", "/api/v2/torrents/info")
@@ -174,16 +185,40 @@ class QBittorrentClient:
 
 def _status_from_item(item: dict[str, object]) -> DownloadStatus:
     torrent_hash = str(item.get("hash", ""))
-    progress = float(item.get("progress", 0.0))
+    progress = _optional_float(item.get("progress"))
     state = DownloadState.COMPLETED if progress >= 1 else DownloadState.DOWNLOADING
     save_path = item.get("save_path")
+    content_path = item.get("content_path")
     return DownloadStatus(
         torrent_hash=torrent_hash,
         name=str(item.get("name", "")),
         state=state,
         progress=progress,
         save_path=Path(str(save_path)) if save_path else None,
+        content_path=Path(str(content_path)) if content_path else None,
     )
+
+
+def _file_from_item(item: dict[str, object]) -> TorrentFile:
+    return TorrentFile(
+        path=Path(str(item.get("name", ""))),
+        size=_optional_int(item.get("size")),
+        progress=_optional_float(item.get("progress")),
+    )
+
+
+def _optional_int(value: object) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _optional_float(value: object) -> float:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _hashes_from_items(items: list[dict[str, object]]) -> set[str]:

@@ -33,13 +33,22 @@ from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPParserConfig,
     NexusPHPSiteConfig,
 )
-from musicpilot.adapters.metadata import MusicBrainzProvider, MutagenTagWriter, NetEaseMusicProvider
+from musicpilot.adapters.metadata import (
+    MultiSourceMusicProvider,
+    MusicBrainzProvider,
+    MutagenTagWriter,
+    NetEaseMusicProvider,
+)
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
-from musicpilot.core.scraping import LocalMusicScraper, scraping_config_from_payload
+from musicpilot.core.scraping import (
+    LocalMusicScraper,
+    ScrapingFileResult,
+    scraping_config_from_payload,
+)
 from musicpilot.infra.api.schemas import (
     DownloaderCreateRequest,
     DownloaderResponse,
@@ -87,6 +96,7 @@ from musicpilot.infra.db.models import (
     TorrentRecord,
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
+from musicpilot.ports.downloader import DownloadStatus, TorrentFile
 from musicpilot.ports.metadata import MediaCandidate
 
 _OPENCC_T2S = OpenCC("t2s")
@@ -215,12 +225,14 @@ class AppState:
         self.downloader: QBittorrentClient | None = None
         self.metadata = MetadataCascade(
             [
+                MultiSourceMusicProvider(),
                 NetEaseMusicProvider(),
                 MusicBrainzProvider(user_agent=settings.musicbrainz_user_agent),
             ]
         )
+        self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
         self.scraper = LocalMusicScraper(
-            metadata=self.metadata,
+            metadata=self.scraping_metadata,
             tag_writer=MutagenTagWriter(),
         )
         self.configured_notifiers: tuple[TelegramHttpNotifier, ...] = ()
@@ -451,7 +463,7 @@ def create_app() -> FastAPI:
         await state.pipeline.stop()
         if state.downloader is not None:
             await state.downloader.close()
-        for provider in state.metadata.providers:
+        for provider in (*state.metadata.providers, *state.scraping_metadata.providers):
             close = getattr(provider, "close", None)
             if close is not None:
                 await close()
@@ -1683,10 +1695,14 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
     if (task.payload or {}).get("scraping_completed"):
         return
     try:
+        source_files = await _scraping_source_files_for_task(state, task)
+        if source_files is None:
+            return
         summary = await state.scraper.process_download(
             task_name=task.name,
             save_path=task.save_path,
             config=config,
+            source_files=source_files,
         )
     except Exception as exc:  # noqa: BLE001
         state.add_log("metadata", f"Scraping failed for {task.name}: {exc}", "WARNING")
@@ -1703,6 +1719,11 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
             status=item.status,
             error_message=item.error_message,
         )
+        state.add_log(
+            "metadata",
+            _scraping_file_log_message(task.name, item),
+            "WARNING" if item.status == "failed" else "INFO",
+        )
     state.add_log(
         "metadata",
         "Scraping completed for "
@@ -1710,6 +1731,141 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
         f"updated={summary.updated_files}, moved={summary.moved_files}, "
         f"failed={summary.failed_files}",
     )
+
+
+async def _scraping_source_files_for_task(
+    state: AppState,
+    task: TorrentRecord,
+) -> tuple[Path, ...] | None:
+    if state.downloader is None:
+        await state.reload_downloader()
+    if state.downloader is None:
+        state.add_log(
+            "metadata",
+            f"Scraping skipped for {task.name}: downloader is unavailable.",
+            "WARNING",
+        )
+        return None
+    if _is_pending_hash(task.torrent_hash):
+        state.add_log(
+            "metadata",
+            f"Scraping skipped for {task.name}: torrent hash is not resolved.",
+            "WARNING",
+        )
+        return None
+    try:
+        status = await state.downloader.get_status(task.torrent_hash or "")
+        torrent_files = await state.downloader.list_files(task.torrent_hash or "")
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "metadata",
+            f"Scraping skipped for {task.name}: qBittorrent file list failed: {exc}",
+            "WARNING",
+        )
+        return None
+    source_files = _resolve_torrent_audio_files(task, status, torrent_files)
+    state.add_log(
+        "metadata",
+        f"Scraping source files resolved for {task.name}: files={len(source_files)}",
+    )
+    return source_files
+
+
+def _resolve_torrent_audio_files(
+    task: TorrentRecord,
+    status: DownloadStatus,
+    torrent_files: tuple[TorrentFile, ...],
+) -> tuple[Path, ...]:
+    seen: set[Path] = set()
+    source_files: list[Path] = []
+    for torrent_file in torrent_files:
+        if torrent_file.progress < 1:
+            continue
+        for candidate in _torrent_file_candidates(task, status, torrent_file.path):
+            if not candidate.is_file() or not _is_audio_file(candidate):
+                continue
+            resolved = candidate.resolve()
+            if resolved in seen:
+                break
+            seen.add(resolved)
+            source_files.append(resolved)
+            break
+    return tuple(source_files)
+
+
+def _torrent_file_candidates(
+    task: TorrentRecord,
+    status: DownloadStatus,
+    relative_path: Path,
+) -> tuple[Path, ...]:
+    if relative_path.is_absolute():
+        return (relative_path,)
+    candidates: list[Path] = []
+    content_path = status.content_path
+    if content_path is not None:
+        if content_path.is_file():
+            candidates.append(content_path)
+        else:
+            candidates.append(content_path / relative_path)
+            candidates.append(content_path.parent / relative_path)
+    roots = [
+        Path(task.save_path) if task.save_path else None,
+        status.save_path,
+    ]
+    for root in roots:
+        if root is None:
+            continue
+        if task.name:
+            candidates.append(root / task.name / relative_path)
+        candidates.append(root / relative_path)
+    return tuple(_dedupe_paths(candidates))
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _is_audio_file(path: Path) -> bool:
+    return path.suffix.casefold() in {
+        ".aac",
+        ".aiff",
+        ".alac",
+        ".ape",
+        ".flac",
+        ".m4a",
+        ".mp3",
+        ".ogg",
+        ".opus",
+        ".wav",
+        ".wma",
+    }
+
+
+def _scraping_file_log_message(task_name: str, item: ScrapingFileResult) -> str:
+    metadata = item.metadata
+    parts = [
+        f"Scraping file {item.status} for {task_name}",
+        f"source={item.source_path}",
+        f"title={metadata.title!r}",
+        f"artist={metadata.artist!r}",
+        f"album={metadata.album!r}",
+        f"needs_update={item.needs_metadata_update}",
+        f"candidates={item.candidate_count}",
+        f"stage={item.stage}",
+    ]
+    if item.library_path is not None:
+        parts.append(f"library={item.library_path}")
+    if item.error_message:
+        parts.append(f"reason={item.error_message}")
+    return ", ".join(parts)
 
 
 def _validate_navidrome_scan_response(response: httpx.Response) -> None:
