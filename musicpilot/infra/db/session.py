@@ -34,6 +34,7 @@ class Database:
         if not self.database_url.startswith("sqlite"):
             return
         async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
             await _add_sqlite_columns(
                 conn,
                 "torrent_records",

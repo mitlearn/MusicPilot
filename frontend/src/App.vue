@@ -88,6 +88,16 @@ type MediaFile = {
   track_number?: number | null
 }
 
+type MusicLibraryTrack = {
+  id: string
+  title: string
+  artist?: string | null
+  album?: string | null
+  duration?: number | null
+  size?: number | null
+  year?: number | null
+}
+
 type Site = {
   id?: string | null
   name: string
@@ -192,12 +202,15 @@ const logsLoading = ref(false)
 const logPaused = ref(false)
 const logLevel = ref('ALL')
 const logQuery = ref('')
+const musicLibraryQuery = ref('')
+const musicLibraryLoading = ref(false)
 let logTimer: number | undefined
 let downloadTimer: number | undefined
 let metadataSearchStream: EventSource | undefined
 
 const downloads = ref<DownloadTask[]>([])
 const mediaFiles = ref<MediaFile[]>([])
+const musicLibraryTracks = ref<MusicLibraryTrack[]>([])
 const sites = ref<Site[]>([])
 const downloaders = ref<DownloaderConfig[]>([])
 const mediaServers = ref<MediaServerConfig[]>([])
@@ -282,6 +295,7 @@ const navItems = [
   { title: '搜索', value: 'search', icon: 'mdi-magnify' },
   { title: '下载', value: 'downloads', icon: 'mdi-download' },
   { title: '整理', value: 'media', icon: 'mdi-music-box-multiple' },
+  { title: '音乐库', value: 'musicLibrary', icon: 'mdi-music-circle-outline' },
   { title: '站点', value: 'sites', icon: 'mdi-server-network' },
   { title: '日志', value: 'logs', icon: 'mdi-text-box-search-outline' },
   { title: '设置', value: 'settings', icon: 'mdi-cog-outline' }
@@ -311,6 +325,34 @@ const filteredLogs = computed(() => {
     const text = `${entry.timestamp} ${entry.category} ${entry.level} ${entry.message}`.toLowerCase()
     return levelMatches && (!keyword || text.includes(keyword))
   })
+})
+
+const filteredMusicLibraryTracks = computed(() => {
+  const keyword = musicLibraryQuery.value.trim().toLowerCase()
+  if (!keyword) return musicLibraryTracks.value
+  return musicLibraryTracks.value.filter((track) =>
+    [track.title, track.artist, track.album, track.year?.toString()]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+      .includes(keyword)
+  )
+})
+
+const musicLibraryStats = computed(() => {
+  const albums = new Set<string>()
+  const artists = new Set<string>()
+  for (const track of musicLibraryTracks.value) {
+    const album = track.album?.trim()
+    const artist = track.artist?.trim()
+    if (album) albums.add(album.toLowerCase())
+    if (artist) artists.add(artist.toLowerCase())
+  }
+  return {
+    songs: musicLibraryTracks.value.length,
+    albums: albums.size,
+    artists: artists.size
+  }
 })
 
 async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -600,6 +642,13 @@ function openDownloadConfirm(result: SearchResult) {
   pendingDownload.value = result
 }
 
+function switchPage(page: string) {
+  activePage.value = page
+  if (page === 'musicLibrary' && !musicLibraryTracks.value.length) {
+    void loadMusicLibrary()
+  }
+}
+
 async function confirmDownload() {
   if (!pendingDownload.value || downloadSubmitting.value) return
   downloadSubmitting.value = true
@@ -631,6 +680,31 @@ async function loadDownloads() {
 
 async function loadMedia() {
   mediaFiles.value = await api<MediaFile[]>('/api/media')
+}
+
+async function loadMusicLibrary() {
+  musicLibraryLoading.value = true
+  try {
+    musicLibraryTracks.value = await api<MusicLibraryTrack[]>('/api/music-library')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '音乐库加载失败', 'error')
+  } finally {
+    musicLibraryLoading.value = false
+  }
+}
+
+async function syncMusicLibrary() {
+  musicLibraryLoading.value = true
+  try {
+    musicLibraryTracks.value = await api<MusicLibraryTrack[]>('/api/music-library/sync', {
+      method: 'POST'
+    })
+    notify('音乐库已同步')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '音乐库同步失败', 'error')
+  } finally {
+    musicLibraryLoading.value = false
+  }
 }
 
 async function loadSites() {
@@ -1056,6 +1130,13 @@ function formatSize(value?: number | null) {
   return `${size.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`
 }
 
+function formatDuration(value?: number | null) {
+  if (!value) return '-'
+  const minutes = Math.floor(value / 60)
+  const seconds = value % 60
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`
+}
+
 function formatTime(value: string) {
   return new Date(value).toLocaleString()
 }
@@ -1126,7 +1207,7 @@ onUnmounted(() => {
             :prepend-icon="item.icon"
             :title="item.title"
             rounded="lg"
-            @click="activePage = item.value"
+            @click="switchPage(item.value)"
           />
         </v-list>
       </v-navigation-drawer>
@@ -1323,6 +1404,58 @@ onUnmounted(() => {
             </v-card>
           </section>
 
+          <section v-if="activePage === 'musicLibrary'" class="page-stack">
+            <div class="toolbar-row">
+              <v-btn
+                prepend-icon="mdi-refresh"
+                variant="tonal"
+                :loading="musicLibraryLoading"
+                @click="syncMusicLibrary"
+              >
+                同步
+              </v-btn>
+              <v-chip color="secondary" variant="tonal">Navidrome</v-chip>
+              <v-chip color="primary" variant="tonal">歌曲 {{ musicLibraryStats.songs }}</v-chip>
+              <v-chip color="primary" variant="tonal">专辑 {{ musicLibraryStats.albums }}</v-chip>
+              <v-chip color="primary" variant="tonal">艺术家 {{ musicLibraryStats.artists }}</v-chip>
+              <v-text-field
+                v-model="musicLibraryQuery"
+                label="搜索音乐库"
+                prepend-inner-icon="mdi-magnify"
+                hide-details
+                clearable
+                class="music-library-search"
+              />
+            </div>
+            <v-card>
+              <v-table>
+                <thead>
+                  <tr>
+                    <th>标题</th>
+                    <th>艺人</th>
+                    <th>专辑</th>
+                    <th>时长</th>
+                    <th>大小</th>
+                    <th>年份</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="!filteredMusicLibraryTracks.length">
+                    <td colspan="6" class="empty-cell">暂无音乐库记录</td>
+                  </tr>
+                  <tr v-for="track in filteredMusicLibraryTracks" :key="track.id">
+                    <td>{{ track.title || '-' }}</td>
+                    <td>{{ track.artist || '-' }}</td>
+                    <td>{{ track.album || '-' }}</td>
+                    <td>{{ formatDuration(track.duration) }}</td>
+                    <td>{{ formatSize(track.size) }}</td>
+                    <td>{{ track.year || '-' }}</td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </v-card>
+          </section>
+
           <section v-if="activePage === 'sites'" class="page-stack">
             <div class="toolbar-row">
               <v-btn color="primary" prepend-icon="mdi-plus" @click="openNewSiteDialog">新增站点</v-btn>
@@ -1342,7 +1475,7 @@ onUnmounted(() => {
                     <v-card
                       v-if="activeConfigMenu === configMenuKey('site', site.id)"
                       class="config-card-menu-panel"
-                      elevation="1"
+                      elevation="0"
                       @click.stop
                     >
                       <button class="config-card-menu-item" type="button" @click="openDeleteSite(site)">
@@ -1431,7 +1564,7 @@ onUnmounted(() => {
                         <v-card
                           v-if="activeConfigMenu === configMenuKey('downloader', downloader.id)"
                           class="config-card-menu-panel"
-                          elevation="1"
+                          elevation="0"
                           @click.stop
                         >
                           <button class="config-card-menu-item" type="button" @click="openDeleteDownloader(downloader)">
@@ -1474,7 +1607,7 @@ onUnmounted(() => {
                         <v-card
                           v-if="activeConfigMenu === configMenuKey('mediaServer', server.id)"
                           class="config-card-menu-panel"
-                          elevation="1"
+                          elevation="0"
                           @click.stop
                         >
                           <button class="config-card-menu-item" type="button" @click="openDeleteMediaServer(server)">
@@ -1517,7 +1650,7 @@ onUnmounted(() => {
                         <v-card
                           v-if="activeConfigMenu === configMenuKey('notifier', notifier.id)"
                           class="config-card-menu-panel"
-                          elevation="1"
+                          elevation="0"
                           @click.stop
                         >
                           <button class="config-card-menu-item" type="button" @click="openDeleteNotifier(notifier)">
@@ -1818,6 +1951,7 @@ onUnmounted(() => {
 }
 
 .config-card-menu-panel {
+  box-shadow: none !important;
   min-width: 72px;
   padding: 2px 0;
   position: absolute;
@@ -1842,5 +1976,10 @@ onUnmounted(() => {
 
 .config-card-menu-item:hover {
   background: rgba(var(--v-theme-error), 0.08);
+}
+
+.music-library-search {
+  max-width: 360px;
+  min-width: 240px;
 }
 </style>

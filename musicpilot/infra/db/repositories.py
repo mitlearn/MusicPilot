@@ -12,6 +12,7 @@ from musicpilot.infra.db.models import (
     DownloaderConfig,
     IndexerSite,
     MediaFile,
+    MusicLibraryTrack,
     MediaServerConfig,
     NotifierChannel,
     Subscription,
@@ -325,6 +326,49 @@ class SqlAlchemyMediaRepository:
             result = await session.execute(select(MediaFile).order_by(MediaFile.id.desc()))
             return list(result.scalars().all())
 
+    async def list_music_library_tracks(self) -> list[MusicLibraryTrack]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MusicLibraryTrack).order_by(
+                    MusicLibraryTrack.artist,
+                    MusicLibraryTrack.album,
+                    MusicLibraryTrack.title,
+                )
+            )
+            return list(result.scalars().all())
+
+    async def sync_music_library_tracks(self, tracks: list[dict[str, Any]]) -> int:
+        synced_at = datetime.now(UTC)
+        seen_ids: set[str] = set()
+        async with self.database.session() as session:
+            result = await session.execute(select(MusicLibraryTrack))
+            existing = {item.navidrome_id: item for item in result.scalars().all()}
+            for payload in tracks:
+                navidrome_id = str(payload.get("id") or "").strip()
+                if not navidrome_id:
+                    continue
+                seen_ids.add(navidrome_id)
+                row = existing.get(navidrome_id)
+                if row is None:
+                    row = MusicLibraryTrack(navidrome_id=navidrome_id, title="")
+                    session.add(row)
+                row.title = str(payload.get("title") or payload.get("name") or "-")
+                row.artist = _optional_string(payload.get("artist"))
+                row.album = _optional_string(payload.get("album"))
+                row.duration = _optional_int(payload.get("duration"))
+                row.size = _optional_int(payload.get("size"))
+                row.year = _optional_int(payload.get("year"))
+                row.suffix = _optional_string(payload.get("suffix"))
+                row.path = _optional_string(payload.get("path"))
+                row.content_type = _optional_string(payload.get("contentType"))
+                row.raw_payload = payload
+                row.last_synced_at = synced_at
+            for navidrome_id, row in existing.items():
+                if navidrome_id not in seen_ids:
+                    await session.delete(row)
+            await session.commit()
+        return len(seen_ids)
+
     async def create_subscription(
         self,
         *,
@@ -422,6 +466,22 @@ def _assign_config_fields(row: object, payload: dict[str, Any], fields: tuple[st
     for field in fields:
         if field in payload:
             setattr(row, field, payload[field])
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 async def _clear_other_defaults(session: object, model: type[object], active_id: str) -> None:

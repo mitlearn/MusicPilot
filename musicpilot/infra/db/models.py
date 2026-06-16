@@ -74,6 +74,24 @@ class MediaFile(TimestampMixin, Base):
     metadata_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
 
 
+class MusicLibraryTrack(TimestampMixin, Base):
+    __tablename__ = "music_library_tracks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    navidrome_id: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(512))
+    artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    album: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    suffix: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class Subscription(TimestampMixin, Base):
     __tablename__ = "subscriptions"
 

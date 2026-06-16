@@ -81,6 +81,31 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_media_files_torrent_hash"), "media_files", ["torrent_hash"])
     op.create_table(
+        "music_library_tracks",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("navidrome_id", sa.String(length=256), nullable=False),
+        sa.Column("title", sa.String(length=512), nullable=False),
+        sa.Column("artist", sa.String(length=512), nullable=True),
+        sa.Column("album", sa.String(length=512), nullable=True),
+        sa.Column("duration", sa.Integer(), nullable=True),
+        sa.Column("size", sa.Integer(), nullable=True),
+        sa.Column("year", sa.Integer(), nullable=True),
+        sa.Column("suffix", sa.String(length=64), nullable=True),
+        sa.Column("path", sa.Text(), nullable=True),
+        sa.Column("content_type", sa.String(length=128), nullable=True),
+        sa.Column("raw_payload", sa.JSON(), nullable=False),
+        sa.Column("last_synced_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("navidrome_id"),
+    )
+    op.create_index(
+        op.f("ix_music_library_tracks_navidrome_id"),
+        "music_library_tracks",
+        ["navidrome_id"],
+    )
+    op.create_table(
         "indexer_sites",
         sa.Column("id", sa.String(length=32), nullable=False),
         sa.Column("name", sa.String(length=128), nullable=False),
@@ -157,6 +182,8 @@ def downgrade() -> None:
     op.drop_table("media_servers")
     op.drop_table("downloaders")
     op.drop_table("indexer_sites")
+    op.drop_index(op.f("ix_music_library_tracks_navidrome_id"), table_name="music_library_tracks")
+    op.drop_table("music_library_tracks")
     op.drop_index(op.f("ix_media_files_torrent_hash"), table_name="media_files")
     op.drop_table("media_files")
     op.drop_index(op.f("ix_torrent_records_torrent_hash"), table_name="torrent_records")

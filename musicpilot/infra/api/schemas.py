@@ -269,3 +269,13 @@ class MediaFileResponse(BaseModel):
     album: str | None
     year: int | None
     track_number: int | None
+
+
+class MusicLibraryTrackResponse(BaseModel):
+    id: str
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    duration: int | None = None
+    size: int | None = None
+    year: int | None = None

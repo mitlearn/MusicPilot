@@ -54,6 +54,7 @@ from musicpilot.infra.api.schemas import (
     MediaFileResponse,
     MediaServerCreateRequest,
     MediaServerResponse,
+    MusicLibraryTrackResponse,
     MetadataSearchResponse,
     MetadataSiteSearchRequest,
     MetadataSiteSearchResponse,
@@ -80,6 +81,7 @@ from musicpilot.infra.db.models import (
     DownloaderConfig,
     IndexerSite,
     MediaServerConfig,
+    MusicLibraryTrack,
     NotifierChannel,
     TorrentRecord,
 )
@@ -88,6 +90,8 @@ from musicpilot.ports.metadata import MediaCandidate
 
 _OPENCC_T2S = OpenCC("t2s")
 DOWNLOAD_POLL_INTERVAL_SECONDS = 5
+MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
+MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
 
 
 class MetadataSiteSearchTask:
@@ -229,6 +233,7 @@ class AppState:
             notifiers=self.notification_sinks,
         )
         self.download_polling_task: asyncio.Task[None] | None = None
+        self.music_library_sync_task: asyncio.Task[None] | None = None
         self.metadata_site_search_task: MetadataSiteSearchTask | None = None
         self.metadata_site_search_worker: asyncio.Task[None] | None = None
 
@@ -353,6 +358,21 @@ class AppState:
         with contextlib.suppress(asyncio.CancelledError):
             await self.download_polling_task
 
+    def start_music_library_sync(self) -> None:
+        if self.music_library_sync_task is not None and not self.music_library_sync_task.done():
+            return
+        self.music_library_sync_task = asyncio.create_task(
+            _sync_music_library_periodically(self),
+            name="musicpilot-music-library-sync",
+        )
+
+    async def stop_music_library_sync(self) -> None:
+        if self.music_library_sync_task is None:
+            return
+        self.music_library_sync_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.music_library_sync_task
+
     def add_log(self, category: str, message: str, level: str = "INFO") -> None:
         self.logs.appendleft(
             {
@@ -404,6 +424,7 @@ def create_app() -> FastAPI:
         await state.reload_notifiers()
         state.pipeline.start()
         state.start_download_polling()
+        state.start_music_library_sync()
         state.scheduler.start()
         for bot in state.bots:
             await bot.start()
@@ -411,6 +432,7 @@ def create_app() -> FastAPI:
         state.add_log("system", "MusicPilot stopping")
         root_logger.removeHandler(state.log_handler)
         await state.stop_download_polling()
+        await state.stop_music_library_sync()
         if state.metadata_site_search_worker is not None:
             state.metadata_site_search_worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -972,6 +994,24 @@ def create_app() -> FastAPI:
             for row in rows
         ]
 
+    @app.get("/api/music-library", response_model=list[MusicLibraryTrackResponse])
+    async def music_library() -> list[MusicLibraryTrackResponse]:
+        return [
+            _music_library_track_response(item)
+            for item in await state.repository.list_music_library_tracks()
+        ]
+
+    @app.post("/api/music-library/sync", response_model=list[MusicLibraryTrackResponse])
+    async def sync_music_library() -> list[MusicLibraryTrackResponse]:
+        try:
+            await _sync_music_library_from_navidrome(state)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Navidrome 音乐库同步失败：{exc}") from exc
+        return [
+            _music_library_track_response(item)
+            for item in await state.repository.list_music_library_tracks()
+        ]
+
     @app.get("/api/subscriptions", response_model=list[SubscriptionResponse])
     async def subscriptions() -> list[SubscriptionResponse]:
         rows = await state.repository.list_subscriptions()
@@ -1224,6 +1264,34 @@ def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
     )
 
 
+def _music_library_track_response(item: MusicLibraryTrack) -> MusicLibraryTrackResponse:
+    return MusicLibraryTrackResponse(
+        id=item.navidrome_id,
+        title=item.title,
+        artist=item.artist,
+        album=item.album,
+        duration=item.duration,
+        size=item.size,
+        year=item.year,
+    )
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_pending_hash(value: str | None) -> bool:
     return value is None or value.startswith("pending:")
 
@@ -1331,6 +1399,62 @@ async def _poll_download_tasks(state: AppState) -> None:
         except Exception as exc:  # noqa: BLE001
             state.add_log("download", f"Download polling failed: {exc}", "ERROR")
         await asyncio.sleep(DOWNLOAD_POLL_INTERVAL_SECONDS)
+
+
+async def _sync_music_library_periodically(state: AppState) -> None:
+    while True:
+        try:
+            await _sync_music_library_from_navidrome(state)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("library", f"Music library sync failed: {exc}", "ERROR")
+        await asyncio.sleep(MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS)
+
+
+async def _sync_music_library_after_refresh(state: AppState) -> None:
+    await asyncio.sleep(MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS)
+    try:
+        await _sync_music_library_from_navidrome(state)
+    except Exception as exc:  # noqa: BLE001
+        state.add_log("library", f"Music library sync after refresh failed: {exc}", "ERROR")
+
+
+async def _sync_music_library_from_navidrome(state: AppState) -> int:
+    server = await state.repository.default_media_server()
+    if server is None:
+        state.add_log("library", "Music library sync skipped: no media server", "WARNING")
+        return 0
+    tracks = await _fetch_navidrome_music_library(server)
+    count = await state.repository.sync_music_library_tracks(tracks)
+    state.add_log("library", f"Music library synced: {count} track(s)")
+    return count
+
+
+async def _fetch_navidrome_music_library(server: MediaServerConfig) -> list[dict[str, Any]]:
+    tracks: list[dict[str, Any]] = []
+    page_size = 500
+    offset = 0
+    async with httpx.AsyncClient(base_url=server.base_url.rstrip("/"), timeout=30) as client:
+        while True:
+            params = {
+                **_navidrome_params(server),
+                "query": "",
+                "artistCount": "0",
+                "albumCount": "0",
+                "songCount": str(page_size),
+                "songOffset": str(offset),
+            }
+            response = await client.get("/rest/search3.view", params=params)
+            response.raise_for_status()
+            payload = _validate_navidrome_json_response(response)
+            search_result = payload.get("searchResult3")
+            songs = search_result.get("song", []) if isinstance(search_result, dict) else []
+            if not isinstance(songs, list) or not songs:
+                break
+            tracks.extend(item for item in songs if isinstance(item, dict))
+            if len(songs) < page_size:
+                break
+            offset += page_size
+    return tracks
 
 
 async def _poll_download_tasks_once(state: AppState) -> None:
@@ -1441,23 +1565,39 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
         library_refreshed_at=datetime.now(UTC),
     )
     state.add_log("library", f"Media library refresh requested: {task.name}")
+    asyncio.create_task(
+        _sync_music_library_after_refresh(state),
+        name="musicpilot-music-library-sync-after-refresh",
+    )
     await _send_event_notifications(state, "library", refreshed or task)
 
 
 def _validate_navidrome_scan_response(response: httpx.Response) -> None:
     response.raise_for_status()
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Navidrome scan returned a non-JSON response.") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Navidrome scan returned an invalid response.")
-    body = payload.get("subsonic-response")
-    if not isinstance(body, dict):
-        raise RuntimeError("Navidrome scan response is missing subsonic-response.")
+    body = _validate_navidrome_json_response(response)
     status = str(body.get("status") or "").casefold()
     if status == "ok":
         return
+    raise RuntimeError(f"Navidrome scan failed: {_navidrome_error_message(body, status)}")
+
+
+def _validate_navidrome_json_response(response: httpx.Response) -> dict[str, object]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Navidrome returned a non-JSON response.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Navidrome returned an invalid response.")
+    body = payload.get("subsonic-response")
+    if not isinstance(body, dict):
+        raise RuntimeError("Navidrome response is missing subsonic-response.")
+    status = str(body.get("status") or "").casefold()
+    if status == "ok":
+        return body
+    raise RuntimeError(f"Navidrome request failed: {_navidrome_error_message(body, status)}")
+
+
+def _navidrome_error_message(body: dict[str, object], status: str) -> str:
     error = body.get("error")
     message = ""
     if isinstance(error, dict):
@@ -1469,7 +1609,7 @@ def _validate_navidrome_scan_response(response: httpx.Response) -> None:
             message = str(detail)
     if not message:
         message = f"unexpected status {status or '<missing>'}"
-    raise RuntimeError(f"Navidrome scan failed: {message}")
+    return message
 
 
 async def _send_event_notifications(
