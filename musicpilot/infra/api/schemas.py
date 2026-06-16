@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -224,12 +225,25 @@ class ProxySettings(BaseModel):
     password: str = ""
 
 
+class ScrapingSettings(BaseModel):
+    enabled: bool = False
+    mode: Literal["source", "mapped", "copy"] = "mapped"
+    source_directory: str = ""
+    mapped_directory: str = ""
+    required_metadata: list[Literal["album", "artist", "lyrics"]] = Field(default_factory=list)
+    auto_rename: bool = False
+    auto_classify: bool = False
+    classify_by: Literal["artist", "album"] = "artist"
+
+
 class SystemSettingsRequest(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
+    scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
 
 
 class SystemSettingsResponse(BaseModel):
-    proxy: ProxySettings
+    proxy: ProxySettings = Field(default_factory=ProxySettings)
+    scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
 
 
 class LogEntryResponse(BaseModel):
@@ -264,6 +278,8 @@ class MediaFileResponse(BaseModel):
     torrent_hash: str | None
     source_path: str
     library_path: str
+    status: str = "success"
+    error_message: str | None = None
     title: str | None
     artist: str | None
     album: str | None

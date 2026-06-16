@@ -73,6 +73,8 @@ def upgrade() -> None:
         sa.Column("album", sa.String(length=512), nullable=True),
         sa.Column("year", sa.Integer(), nullable=True),
         sa.Column("track_number", sa.Integer(), nullable=True),
+        sa.Column("status", sa.String(length=64), nullable=False),
+        sa.Column("error_message", sa.Text(), nullable=True),
         sa.Column("metadata", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),

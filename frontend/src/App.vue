@@ -81,6 +81,8 @@ type MediaFile = {
   torrent_hash?: string | null
   source_path: string
   library_path: string
+  status: string
+  error_message?: string | null
   title?: string | null
   artist?: string | null
   album?: string | null
@@ -150,6 +152,16 @@ type SystemSettings = {
     username: string
     password: string
   }
+  scraping: {
+    enabled: boolean
+    mode: 'source' | 'mapped' | 'copy'
+    source_directory: string
+    mapped_directory: string
+    required_metadata: Array<'album' | 'artist' | 'lyrics'>
+    auto_rename: boolean
+    auto_classify: boolean
+    classify_by: 'artist' | 'album'
+  }
 }
 
 type LogEntry = {
@@ -209,6 +221,7 @@ let downloadTimer: number | undefined
 let metadataSearchStream: EventSource | undefined
 
 const downloads = ref<DownloadTask[]>([])
+const selectedDownloadIds = ref<number[]>([])
 const mediaFiles = ref<MediaFile[]>([])
 const musicLibraryTracks = ref<MusicLibraryTrack[]>([])
 const sites = ref<Site[]>([])
@@ -221,11 +234,13 @@ const downloaderDialog = ref(false)
 const mediaServerDialog = ref(false)
 const notifierDialog = ref(false)
 const deleteDialog = ref(false)
+const downloadDeleteDialog = ref(false)
 const siteTesting = ref(false)
 const downloaderTesting = ref(false)
 const mediaServerTesting = ref(false)
 const notifierTesting = ref(false)
 const deleting = ref(false)
+const downloadDeleting = ref(false)
 const systemSaving = ref(false)
 const editingSiteId = ref<string | null>(null)
 const editingDownloaderId = ref<string | null>(null)
@@ -234,6 +249,8 @@ const editingNotifierId = ref<string | null>(null)
 
 const snackbar = ref({ show: false, color: 'success', text: '' })
 const deleteTarget = ref<DeleteTarget | null>(null)
+const pendingDownloadDeleteIds = ref<number[]>([])
+const pendingDownloadDeleteLabel = ref('')
 const activeConfigMenu = ref<string | null>(null)
 
 const siteForm = ref({
@@ -288,8 +305,35 @@ const systemForm = ref<SystemSettings>({
     port: 0,
     username: '',
     password: ''
+  },
+  scraping: {
+    enabled: false,
+    mode: 'mapped',
+    source_directory: '',
+    mapped_directory: '',
+    required_metadata: [],
+    auto_rename: false,
+    auto_classify: false,
+    classify_by: 'artist'
   }
 })
+
+const scrapingModeOptions = [
+  { title: '源文件', value: 'source' },
+  { title: '映射文件', value: 'mapped' },
+  { title: '复制文件', value: 'copy' }
+]
+
+const scrapingRequiredMetadataOptions = [
+  { title: '专辑', value: 'album' },
+  { title: '艺术家', value: 'artist' },
+  { title: '歌词', value: 'lyrics' }
+]
+
+const scrapingClassifyOptions = [
+  { title: '艺术家', value: 'artist' },
+  { title: '专辑', value: 'album' }
+]
 
 const navItems = [
   { title: '搜索', value: 'search', icon: 'mdi-magnify' },
@@ -354,6 +398,25 @@ const musicLibraryStats = computed(() => {
     artists: artists.size
   }
 })
+
+const downloadableTaskIds = computed(() =>
+  downloads.value.map((item) => item.id).filter((id): id is number => typeof id === 'number')
+)
+
+const allDownloadsSelected = computed({
+  get: () =>
+    downloadableTaskIds.value.length > 0 &&
+    downloadableTaskIds.value.every((id) => selectedDownloadIds.value.includes(id)),
+  set: (selected: boolean) => {
+    selectedDownloadIds.value = selected ? [...downloadableTaskIds.value] : []
+  }
+})
+
+const someDownloadsSelected = computed(
+  () =>
+    selectedDownloadIds.value.length > 0 &&
+    !downloadableTaskIds.value.every((id) => selectedDownloadIds.value.includes(id))
+)
 
 async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, {
@@ -676,6 +739,43 @@ async function addDownload(result: SearchResult) {
 
 async function loadDownloads() {
   downloads.value = await api<DownloadTask[]>('/api/downloads')
+  const existingIds = new Set(downloadableTaskIds.value)
+  selectedDownloadIds.value = selectedDownloadIds.value.filter((id) => existingIds.has(id))
+}
+
+function deleteDownloadTask(task: DownloadTask) {
+  if (typeof task.id !== 'number') return
+  pendingDownloadDeleteIds.value = [task.id]
+  pendingDownloadDeleteLabel.value = `下载任务“${task.name}”`
+  downloadDeleteDialog.value = true
+}
+
+function deleteSelectedDownloads() {
+  const ids = [...selectedDownloadIds.value]
+  if (!ids.length) return
+  pendingDownloadDeleteIds.value = ids
+  pendingDownloadDeleteLabel.value = `选中的 ${ids.length} 个下载任务`
+  downloadDeleteDialog.value = true
+}
+
+async function confirmDeleteDownloads() {
+  const ids = [...pendingDownloadDeleteIds.value]
+  if (!ids.length) return
+  downloadDeleting.value = true
+  try {
+    await Promise.all(ids.map((id) => apiNoContent(`/api/downloads/${id}`, { method: 'DELETE' })))
+    selectedDownloadIds.value = selectedDownloadIds.value.filter((id) => !ids.includes(id))
+    pendingDownloadDeleteIds.value = []
+    pendingDownloadDeleteLabel.value = ''
+    downloadDeleteDialog.value = false
+    await loadDownloads()
+    notify('下载任务已删除')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '下载任务删除失败', 'error')
+    await loadDownloads()
+  } finally {
+    downloadDeleting.value = false
+  }
 }
 
 async function loadMedia() {
@@ -1096,7 +1196,17 @@ async function confirmDelete() {
 }
 
 async function loadSystemSettings() {
-  systemForm.value = await api<SystemSettings>('/api/settings/system')
+  const settings = await api<SystemSettings>('/api/settings/system')
+  systemForm.value = {
+    proxy: {
+      ...systemForm.value.proxy,
+      ...(settings.proxy ?? {})
+    },
+    scraping: {
+      ...systemForm.value.scraping,
+      ...(settings.scraping ?? {})
+    }
+  }
 }
 
 async function saveSystemSettings() {
@@ -1353,24 +1463,62 @@ onUnmounted(() => {
           <section v-if="activePage === 'downloads'" class="page-stack">
             <div class="toolbar-row">
               <v-btn prepend-icon="mdi-refresh" variant="tonal" @click="loadDownloads">刷新</v-btn>
+              <v-btn
+                prepend-icon="mdi-delete"
+                color="error"
+                variant="tonal"
+                :disabled="!selectedDownloadIds.length"
+                @click="deleteSelectedDownloads"
+              >
+                删除
+              </v-btn>
             </div>
             <v-card>
               <v-table>
                 <thead>
                   <tr>
+                    <th class="select-cell">
+                      <v-checkbox
+                        v-model="allDownloadsSelected"
+                        :indeterminate="someDownloadsSelected"
+                        density="compact"
+                        hide-details
+                      />
+                    </th>
                     <th>名称</th>
                     <th>状态</th>
                     <th>进度</th>
                     <th>保存路径</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!downloads.length"><td colspan="4" class="empty-cell">暂无下载任务</td></tr>
+                  <tr v-if="!downloads.length"><td colspan="6" class="empty-cell">暂无下载任务</td></tr>
                   <tr v-for="row in downloads" :key="row.id || row.torrent_hash || row.name">
+                    <td class="select-cell">
+                      <v-checkbox
+                        v-if="typeof row.id === 'number'"
+                        v-model="selectedDownloadIds"
+                        :value="row.id"
+                        density="compact"
+                        hide-details
+                      />
+                    </td>
                     <td>{{ row.name }}</td>
                     <td><v-chip size="small" variant="tonal">{{ row.state }}</v-chip></td>
                     <td><v-progress-linear :model-value="progressPercent(row.progress)" height="8" rounded /></td>
                     <td class="path-cell">{{ row.save_path || '-' }}</td>
+                    <td>
+                      <v-btn
+                        icon="mdi-delete"
+                        color="error"
+                        variant="text"
+                        size="small"
+                        title="删除任务"
+                        :disabled="typeof row.id !== 'number'"
+                        @click="deleteDownloadTask(row)"
+                      />
+                    </td>
                   </tr>
                 </tbody>
               </v-table>
@@ -1388,16 +1536,28 @@ onUnmounted(() => {
                     <th>标题</th>
                     <th>艺人</th>
                     <th>专辑</th>
+                    <th>状态</th>
                     <th>入库路径</th>
+                    <th>失败原因</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!mediaFiles.length"><td colspan="4" class="empty-cell">暂无整理记录</td></tr>
+                  <tr v-if="!mediaFiles.length"><td colspan="6" class="empty-cell">暂无整理记录</td></tr>
                   <tr v-for="row in mediaFiles" :key="row.id">
                     <td>{{ row.title || '-' }}</td>
                     <td>{{ row.artist || '-' }}</td>
                     <td>{{ row.album || '-' }}</td>
-                    <td class="path-cell">{{ row.library_path }}</td>
+                    <td>
+                      <v-chip
+                        :color="row.status === 'failed' ? 'error' : 'success'"
+                        size="small"
+                        variant="tonal"
+                      >
+                        {{ row.status === 'failed' ? '失败' : '成功' }}
+                      </v-chip>
+                    </td>
+                    <td class="path-cell">{{ row.status === 'failed' ? row.source_path : row.library_path }}</td>
+                    <td>{{ row.error_message || '-' }}</td>
                   </tr>
                 </tbody>
               </v-table>
@@ -1681,7 +1841,85 @@ onUnmounted(() => {
                   <v-card-actions>
                     <v-spacer />
                     <v-btn color="primary" :loading="systemSaving" @click="saveSystemSettings">
-                      保存系统设置
+                      保存网络设置
+                    </v-btn>
+                  </v-card-actions>
+                </v-card>
+
+                <v-card class="settings-card mt-4">
+                  <v-card-title>刮削设置</v-card-title>
+                  <v-card-text>
+                    <div class="settings-grid">
+                      <v-switch
+                        v-model="systemForm.scraping.enabled"
+                        class="compact-switch"
+                        color="primary"
+                        density="compact"
+                        hide-details
+                        inset
+                        label="开启刮削"
+                      />
+                      <v-select
+                        v-model="systemForm.scraping.mode"
+                        :items="scrapingModeOptions"
+                        label="刮削类型"
+                      />
+                      <v-text-field
+                        v-model="systemForm.scraping.source_directory"
+                        label="源文件目录"
+                      />
+                      <v-text-field
+                        v-if="systemForm.scraping.mode !== 'source'"
+                        v-model="systemForm.scraping.mapped_directory"
+                        :label="systemForm.scraping.mode === 'copy' ? '复制目录' : '映射目录'"
+                      />
+                    </div>
+
+                    <div class="settings-checks">
+                      <div class="settings-checks-label">刮削内容</div>
+                      <div class="settings-checks-row">
+                        <v-checkbox
+                          v-for="item in scrapingRequiredMetadataOptions"
+                          :key="item.value"
+                          v-model="systemForm.scraping.required_metadata"
+                          :label="item.title"
+                          :value="item.value"
+                          hide-details
+                        />
+                      </div>
+                    </div>
+
+                    <div class="settings-grid">
+                      <v-switch
+                        v-model="systemForm.scraping.auto_rename"
+                        class="compact-switch"
+                        color="primary"
+                        density="compact"
+                        hide-details
+                        inset
+                        label="自动重命名"
+                      />
+                      <v-switch
+                        v-model="systemForm.scraping.auto_classify"
+                        class="compact-switch"
+                        color="primary"
+                        density="compact"
+                        hide-details
+                        inset
+                        label="自动分类"
+                      />
+                      <v-select
+                        v-if="systemForm.scraping.auto_classify"
+                        v-model="systemForm.scraping.classify_by"
+                        :items="scrapingClassifyOptions"
+                        label="分类方式"
+                      />
+                    </div>
+                  </v-card-text>
+                  <v-card-actions>
+                    <v-spacer />
+                    <v-btn color="primary" :loading="systemSaving" @click="saveSystemSettings">
+                      保存刮削设置
                     </v-btn>
                   </v-card-actions>
                 </v-card>
@@ -1925,6 +2163,27 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="downloadDeleteDialog" max-width="420">
+      <v-card title="确认删除">
+        <v-card-text>
+          确定删除{{ pendingDownloadDeleteLabel }}吗？
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn
+            variant="text"
+            :disabled="downloadDeleting"
+            @click="downloadDeleteDialog = false"
+          >
+            取消
+          </v-btn>
+          <v-btn color="error" :loading="downloadDeleting" @click="confirmDeleteDownloads">
+            删除
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" location="top right">
       {{ snackbar.text }}
     </v-snackbar>
@@ -1981,5 +2240,43 @@ onUnmounted(() => {
 .music-library-search {
   max-width: 360px;
   min-width: 240px;
+}
+
+.select-cell {
+  width: 48px;
+}
+
+.settings-checks {
+  margin: 8px 0 16px;
+}
+
+.settings-checks-label {
+  color: rgba(var(--v-theme-on-surface), 0.72);
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.settings-checks-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+
+.compact-switch {
+  --v-input-control-height: 32px;
+}
+
+.compact-switch :deep(.v-selection-control) {
+  min-height: 32px;
+}
+
+.compact-switch :deep(.v-switch__track) {
+  height: 18px;
+  min-width: 34px;
+}
+
+.compact-switch :deep(.v-switch__thumb) {
+  height: 14px;
+  width: 14px;
 }
 </style>

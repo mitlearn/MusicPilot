@@ -57,6 +57,14 @@ class Database:
                     "enabled": "BOOLEAN NOT NULL DEFAULT 1",
                 },
             )
+            await _add_sqlite_columns(
+                conn,
+                "media_files",
+                {
+                    "status": "VARCHAR(64) NOT NULL DEFAULT 'success'",
+                    "error_message": "TEXT",
+                },
+            )
 
     async def dispose(self) -> None:
         await self.engine.dispose()

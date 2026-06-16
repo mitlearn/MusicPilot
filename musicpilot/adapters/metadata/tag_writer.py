@@ -3,15 +3,22 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import httpx
+
 from musicpilot.ports.metadata import TrackMetadata
 
 
 class MutagenTagWriter:
     async def write(self, path: Path, metadata: TrackMetadata) -> None:
-        await asyncio.to_thread(_write_tags_sync, path, metadata)
+        cover = await _fetch_cover(metadata.cover_url)
+        await asyncio.to_thread(_write_tags_sync, path, metadata, cover)
 
 
-def _write_tags_sync(path: Path, metadata: TrackMetadata) -> None:
+def _write_tags_sync(
+    path: Path,
+    metadata: TrackMetadata,
+    cover: tuple[bytes, str] | None = None,
+) -> None:
     from mutagen import File as MutagenFile
 
     audio = MutagenFile(path, easy=True)
@@ -36,8 +43,98 @@ def _write_tags_sync(path: Path, metadata: TrackMetadata) -> None:
     if metadata.lyrics:
         _set_tag(audio, "lyrics", metadata.lyrics)
     audio.save()
+    if metadata.lyrics:
+        _write_lyrics_sync(path, metadata.lyrics)
+    if cover is not None:
+        _write_cover_sync(path, cover[0], cover[1])
 
 
 def _set_tag(audio: object, key: str, value: str | None) -> None:
     if value:
-        audio[key] = [value]
+        try:
+            audio[key] = [value]
+        except Exception:
+            return
+
+
+async def _fetch_cover(cover_url: str | None) -> tuple[bytes, str] | None:
+    if not cover_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            response = await client.get(cover_url)
+            response.raise_for_status()
+    except Exception:
+        return None
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type not in {"image/jpeg", "image/png"}:
+        if response.content.startswith(b"\xff\xd8"):
+            content_type = "image/jpeg"
+        elif response.content.startswith(b"\x89PNG"):
+            content_type = "image/png"
+        else:
+            return None
+    if not response.content or len(response.content) > 10 * 1024 * 1024:
+        return None
+    return response.content, content_type
+
+
+def _write_cover_sync(path: Path, cover_data: bytes, mime: str) -> None:
+    from mutagen import File as MutagenFile
+    from mutagen.flac import FLAC, Picture
+    from mutagen.id3 import APIC
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4, MP4Cover
+
+    audio = MutagenFile(path)
+    if audio is None:
+        return
+    if isinstance(audio, MP3):
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.delall("APIC")
+        audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_data))
+        audio.save()
+        return
+    if isinstance(audio, FLAC):
+        picture = Picture()
+        picture.type = 3
+        picture.mime = mime
+        picture.desc = "Cover"
+        picture.data = cover_data
+        audio.clear_pictures()
+        audio.add_picture(picture)
+        audio.save()
+        return
+    if isinstance(audio, MP4):
+        image_format = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+        audio["covr"] = [MP4Cover(cover_data, imageformat=image_format)]
+        audio.save()
+
+
+def _write_lyrics_sync(path: Path, lyrics: str) -> None:
+    from mutagen import File as MutagenFile
+    from mutagen.flac import FLAC
+    from mutagen.id3 import USLT
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+
+    audio = MutagenFile(path)
+    if audio is None:
+        return
+    if isinstance(audio, MP3):
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.delall("USLT")
+        audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
+        audio.save()
+        return
+    if isinstance(audio, FLAC | OggVorbis | OggOpus):
+        audio["LYRICS"] = [lyrics]
+        audio.save()
+        return
+    if isinstance(audio, MP4):
+        audio["\xa9lyr"] = [lyrics]
+        audio.save()

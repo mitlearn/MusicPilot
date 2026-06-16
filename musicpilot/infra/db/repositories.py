@@ -12,8 +12,8 @@ from musicpilot.infra.db.models import (
     DownloaderConfig,
     IndexerSite,
     MediaFile,
-    MusicLibraryTrack,
     MediaServerConfig,
+    MusicLibraryTrack,
     NotifierChannel,
     Subscription,
     SystemSetting,
@@ -55,6 +55,45 @@ class SqlAlchemyMediaRepository:
             media_file.album = metadata.album
             media_file.year = metadata.year
             media_file.track_number = metadata.track_number
+            media_file.status = "success"
+            media_file.error_message = None
+            media_file.metadata_payload = asdict(metadata)
+            await session.commit()
+
+    async def record_scraping_result(
+        self,
+        *,
+        torrent_hash: str | None,
+        source_path: Path,
+        library_path: Path | None,
+        metadata: TrackMetadata,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        result_path = library_path or source_path
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MediaFile).where(MediaFile.source_path == str(source_path))
+            )
+            media_file = result.scalar_one_or_none()
+            if media_file is None:
+                media_file = MediaFile(
+                    torrent_hash=torrent_hash,
+                    source_path=str(source_path),
+                    library_path=str(result_path),
+                )
+                session.add(media_file)
+
+            media_file.torrent_hash = torrent_hash
+            media_file.source_path = str(source_path)
+            media_file.library_path = str(result_path)
+            media_file.title = metadata.title
+            media_file.artist = metadata.artist
+            media_file.album = metadata.album
+            media_file.year = metadata.year
+            media_file.track_number = metadata.track_number
+            media_file.status = status
+            media_file.error_message = error_message
             media_file.metadata_payload = asdict(metadata)
             await session.commit()
 
@@ -315,6 +354,15 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(row)
             return row
+
+    async def delete_download_task(self, task_id: int) -> bool:
+        async with self.database.session() as session:
+            row = await session.get(TorrentRecord, task_id)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
 
     async def list_subscriptions(self) -> list[Subscription]:
         async with self.database.session() as session:

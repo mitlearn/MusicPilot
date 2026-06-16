@@ -24,29 +24,59 @@ class MusicBrainzProvider:
             await self._client.aclose()
 
     async def lookup(self, *, title: str, artist: str | None = None) -> TrackMetadata | None:
+        candidates = await self.search_metadata(title=title, artist=artist, limit=1)
+        return candidates[0] if candidates else None
+
+    async def search_metadata(
+        self,
+        *,
+        title: str,
+        artist: str | None = None,
+        limit: int = 5,
+    ) -> tuple[TrackMetadata, ...]:
         query = f'recording:"{title}"'
         if artist:
             query += f' AND artist:"{artist}"'
         response = await self._client.get(
             "/recording",
-            params={"query": query, "fmt": "json", "limit": 1},
+            params={
+                "query": query,
+                "fmt": "json",
+                "limit": max(1, min(limit, 25)),
+                "inc": "artist-credits+releases",
+            },
         )
         response.raise_for_status()
-        recordings = response.json().get("recordings", [])
-        if not recordings:
-            return None
-        item = recordings[0]
-        artist_credit = item.get("artist-credit") or []
-        artist_name = artist_credit[0].get("name") if artist_credit else artist
-        releases = item.get("releases") or []
-        first_release = releases[0] if releases else {}
-        return TrackMetadata(
-            title=item.get("title", title),
-            artist=artist_name,
-            album=first_release.get("title"),
-            year=_parse_year(first_release.get("date")),
-            extra={"musicbrainz_recording_id": item.get("id", "")},
-        )
+        candidates: list[TrackMetadata] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in response.json().get("recordings", []):
+            item_title = str(item.get("title") or title)
+            artist_credit = item.get("artist-credit") or []
+            artist_name = str(artist_credit[0].get("name")) if artist_credit else artist
+            releases = item.get("releases") or [{}]
+            for release in releases[:3]:
+                album = str(release.get("title") or "")
+                key = (item_title.casefold(), str(artist_name or "").casefold(), album.casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(
+                    TrackMetadata(
+                        title=item_title,
+                        artist=artist_name,
+                        album=album or None,
+                        year=_parse_year(release.get("date")),
+                        cover_url=_cover_url(str(release.get("id"))) if release.get("id") else None,
+                        extra={
+                            "source": self.name,
+                            "musicbrainz_recording_id": str(item.get("id") or ""),
+                            "musicbrainz_release_id": str(release.get("id") or ""),
+                        },
+                    )
+                )
+                if len(candidates) >= limit:
+                    return tuple(candidates)
+        return tuple(candidates)
 
     async def search(self, query: str, *, limit: int = 10) -> tuple[MediaCandidate, ...]:
         response = await self._client.get(

@@ -32,3 +32,11 @@ class MetadataProvider(Protocol):
     def name(self) -> str: ...
 
     async def lookup(self, *, title: str, artist: str | None = None) -> TrackMetadata | None: ...
+
+    async def search_metadata(
+        self,
+        *,
+        title: str,
+        artist: str | None = None,
+        limit: int = 5,
+    ) -> tuple[TrackMetadata, ...]: ...

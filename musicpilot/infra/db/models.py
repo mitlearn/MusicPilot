@@ -71,6 +71,8 @@ class MediaFile(TimestampMixin, Base):
     album: Mapped[str | None] = mapped_column(String(512), nullable=True)
     year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     track_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(64), default="success")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
 
 

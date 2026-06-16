@@ -15,7 +15,7 @@ from html import escape
 from pathlib import Path
 from secrets import compare_digest
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
 import httpx
@@ -33,12 +33,13 @@ from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPParserConfig,
     NexusPHPSiteConfig,
 )
-from musicpilot.adapters.metadata import MusicBrainzProvider, MutagenTagWriter
+from musicpilot.adapters.metadata import MusicBrainzProvider, MutagenTagWriter, NetEaseMusicProvider
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
+from musicpilot.core.scraping import LocalMusicScraper, scraping_config_from_payload
 from musicpilot.infra.api.schemas import (
     DownloaderCreateRequest,
     DownloaderResponse,
@@ -54,10 +55,10 @@ from musicpilot.infra.api.schemas import (
     MediaFileResponse,
     MediaServerCreateRequest,
     MediaServerResponse,
-    MusicLibraryTrackResponse,
     MetadataSearchResponse,
     MetadataSiteSearchRequest,
     MetadataSiteSearchResponse,
+    MusicLibraryTrackResponse,
     NexusPHPParserRequest,
     NotifierCreateRequest,
     NotifierResponse,
@@ -213,7 +214,14 @@ class AppState:
         )
         self.downloader: QBittorrentClient | None = None
         self.metadata = MetadataCascade(
-            [MusicBrainzProvider(user_agent=settings.musicbrainz_user_agent)]
+            [
+                NetEaseMusicProvider(),
+                MusicBrainzProvider(user_agent=settings.musicbrainz_user_agent),
+            ]
+        )
+        self.scraper = LocalMusicScraper(
+            metadata=self.metadata,
+            tag_writer=MutagenTagWriter(),
         )
         self.configured_notifiers: tuple[TelegramHttpNotifier, ...] = ()
         self.bots = self._build_bots(settings)
@@ -676,9 +684,11 @@ def create_app() -> FastAPI:
             category=payload.category,
         )
         try:
-            torrent_hash = await state.downloader.add_torrent(
-                str(resource["download_url"]),
-                category=payload.category,
+            torrent_hash = await _submit_torrent_to_downloader(
+                state,
+                resource,
+                payload.selected_site_ids,
+                payload.category,
             )
         except Exception as exc:  # noqa: BLE001
             await state.repository.update_download_task(
@@ -708,6 +718,12 @@ def create_app() -> FastAPI:
     async def downloads() -> list[DownloadTaskResponse]:
         tasks = await state.repository.list_download_tasks()
         return [_download_task_response(item) for item in tasks]
+
+    @app.delete("/api/downloads/{task_id}", status_code=204)
+    async def delete_download(task_id: int) -> None:
+        deleted = await state.repository.delete_download_task(task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Download task not found.")
 
     @app.get("/api/indexers", response_model=list[IndexerResponse])
     async def indexers() -> list[IndexerResponse]:
@@ -985,6 +1001,8 @@ def create_app() -> FastAPI:
                 torrent_hash=row.torrent_hash,
                 source_path=row.source_path,
                 library_path=row.library_path,
+                status=row.status,
+                error_message=row.error_message,
                 title=row.title,
                 artist=row.artist,
                 album=row.album,
@@ -1078,6 +1096,84 @@ async def _search_indexer(
 ) -> tuple[str, tuple[SearchResult, ...]]:
     results = await indexer.search(query, limit=limit)
     return indexer.name, results
+
+
+async def _submit_torrent_to_downloader(
+    state: AppState,
+    resource: dict[str, Any],
+    selected_site_ids: list[str],
+    category: str,
+) -> str:
+    if state.downloader is None:
+        raise RuntimeError("No downloader is configured.")
+    download_url = str(resource.get("download_url") or "")
+    site = await _match_torrent_site(state, resource, selected_site_ids)
+    if site is None:
+        return await state.downloader.add_torrent(download_url, category=category)
+    torrent_data = await _download_torrent_file(download_url, site)
+    return await state.downloader.add_torrent_file(
+        torrent_data,
+        filename=_torrent_filename(resource, download_url),
+        category=category,
+    )
+
+
+async def _match_torrent_site(
+    state: AppState,
+    resource: dict[str, Any],
+    selected_site_ids: list[str],
+) -> IndexerSite | None:
+    sites = await state.repository.list_indexer_sites()
+    enabled_sites = [site for site in sites if site.enabled]
+    selected = [site for site in enabled_sites if site.id in selected_site_ids]
+    if len(selected) == 1:
+        return selected[0]
+
+    source = str(resource.get("source") or "").strip().casefold()
+    for site in enabled_sites:
+        if site.name.strip().casefold() == source:
+            return site
+
+    download_host = urlparse(str(resource.get("download_url") or "")).netloc.casefold()
+    if not download_host:
+        return None
+    for site in enabled_sites:
+        site_host = urlparse(site.base_url).netloc.casefold()
+        if site_host and site_host == download_host:
+            return site
+    return None
+
+
+async def _download_torrent_file(download_url: str, site: IndexerSite) -> bytes:
+    headers: dict[str, str] = {}
+    if site.cookie:
+        headers["Cookie"] = site.cookie
+    if site.user_agent:
+        headers["User-Agent"] = site.user_agent
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, http2=True) as client:
+        response = await client.get(download_url, headers=headers)
+    response.raise_for_status()
+    content = response.content
+    if not _looks_like_torrent_file(content):
+        preview = response.text[:120].replace("\r", " ").replace("\n", " ")
+        raise RuntimeError(
+            "下载种子文件失败：站点返回的不是 torrent 文件。"
+            f"请检查 {site.name} 的 Cookie/UA。返回内容：{preview}"
+        )
+    return content
+
+
+def _looks_like_torrent_file(content: bytes) -> bool:
+    return content.startswith(b"d") and b"announce" in content[:4096]
+
+
+def _torrent_filename(resource: dict[str, Any], download_url: str) -> str:
+    path_name = unquote(Path(urlparse(download_url).path).name)
+    if path_name.endswith(".torrent"):
+        return path_name
+    title = str(resource.get("title") or "musicpilot").strip()
+    safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", title).strip(" .")
+    return f"{safe_title or 'musicpilot'}.torrent"
 
 
 async def _run_metadata_site_search_stream(
@@ -1483,6 +1579,12 @@ async def _poll_download_tasks_once(state: AppState) -> None:
                     torrent_hash=status.torrent_hash,
                 )
         if status is None:
+            if has_real_hash:
+                await state.repository.update_download_task(
+                    task.id,
+                    status="deleted",
+                    last_error="qBittorrent 中未找到该任务，可能已被删除。",
+                )
             continue
         changes: dict[str, object] = {
             "progress": status.progress,
@@ -1537,6 +1639,7 @@ def _match_tokens(value: str) -> set[str]:
 async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> None:
     if task.status != "refreshing_library":
         await state.repository.update_download_task(task.id, status="refreshing_library")
+    await _scrape_download_for_task(state, task)
     server = await state.repository.default_media_server()
     if server is None:
         await state.repository.update_download_task(
@@ -1570,6 +1673,43 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
         name="musicpilot-music-library-sync-after-refresh",
     )
     await _send_event_notifications(state, "library", refreshed or task)
+
+
+async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> None:
+    settings_payload = await state.repository.get_system_settings()
+    config = scraping_config_from_payload(settings_payload)
+    if not config.enabled:
+        return
+    if (task.payload or {}).get("scraping_completed"):
+        return
+    try:
+        summary = await state.scraper.process_download(
+            task_name=task.name,
+            save_path=task.save_path,
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        state.add_log("metadata", f"Scraping failed for {task.name}: {exc}", "WARNING")
+        return
+    payload = dict(task.payload or {})
+    payload["scraping_completed"] = True
+    await state.repository.update_download_task(task.id, payload=payload)
+    for item in summary.results:
+        await state.repository.record_scraping_result(
+            torrent_hash=task.torrent_hash,
+            source_path=item.source_path,
+            library_path=item.library_path,
+            metadata=item.metadata,
+            status=item.status,
+            error_message=item.error_message,
+        )
+    state.add_log(
+        "metadata",
+        "Scraping completed for "
+        f"{task.name}: files={summary.source_files}, mapped={summary.mapped_files}, "
+        f"updated={summary.updated_files}, moved={summary.moved_files}, "
+        f"failed={summary.failed_files}",
+    )
 
 
 def _validate_navidrome_scan_response(response: httpx.Response) -> None:
