@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install \
       --system \
       --verbose \
-      --default-index https://pypi.tuna.tsinghua.edu.cn/simple \
+      --default-index https://pypi.org/simple \
       . \
     && mkdir -p /data /music /downloads /config \
     && cp -n /app/config/sites.parser.yaml /config/sites.parser.yaml
