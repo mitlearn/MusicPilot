@@ -282,6 +282,121 @@ class NotifierResponse(BaseModel):
     enabled: bool = True
 
 
+class MusicPlatformConnectRequest(BaseModel):
+    platform: Literal["spotify"] = "spotify"
+    client_id: str = Field(min_length=1)
+    client_secret: str = Field(min_length=1)
+    redirect_uri: str = Field(min_length=1)
+
+
+class MusicPlatformConnectResponse(BaseModel):
+    connection_id: str
+    authorization_url: str
+
+
+class MusicPlatformResponse(BaseModel):
+    id: str
+    platform: str
+    display_name: str = ""
+    external_user_id: str | None = None
+    status: str
+    redirect_uri: str
+    scopes: list[str] = Field(default_factory=list)
+    access_token_expires_at: datetime | None = None
+    refresh_token_expires_at: datetime | None = None
+    last_synced_at: datetime | None = None
+    last_error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlaylistAvailableResponse(BaseModel):
+    external_id: str
+    name: str
+    owner_name: str | None = None
+    description: str | None = None
+    cover_url: str | None = None
+    track_count: int = 0
+    raw_payload: dict[str, object] = Field(default_factory=dict)
+
+
+class PlaylistImportRequest(BaseModel):
+    connection_id: str = Field(min_length=1)
+    external_ids: list[str] = Field(min_length=1)
+
+
+class PlaylistImportUrlRequest(BaseModel):
+    import_token: str = ""
+    url: str = ""
+
+
+class PlaylistImportUrlPreviewRequest(BaseModel):
+    url: str = Field(min_length=1)
+
+
+class PlaylistImportUrlPreviewResponse(BaseModel):
+    import_token: str
+    platform: str
+    external_id: str
+    name: str
+    owner_name: str | None = None
+    description: str | None = None
+    cover_url: str | None = None
+    track_count: int = 0
+
+
+class PlaylistResponse(BaseModel):
+    id: int
+    platform_connection_id: str
+    platform: str
+    external_id: str
+    name: str
+    owner_name: str | None = None
+    description: str | None = None
+    cover_url: str | None = None
+    track_count: int = 0
+    existing_count: int = 0
+    waiting_count: int = 0
+    submitted_count: int = 0
+    failed_count: int = 0
+    status: str
+    last_synced_at: datetime | None = None
+    last_download_started_at: datetime | None = None
+    last_error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlaylistTrackResponse(BaseModel):
+    id: int
+    playlist_id: int
+    platform: str
+    external_id: str
+    position: int
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    duration: int | None = None
+    isrc: str | None = None
+    cover_url: str | None = None
+    exists_in_library: bool = False
+    matched_library_track_id: int | None = None
+    download_status: str
+    torrent_record_id: int | None = None
+    last_checked_at: datetime | None = None
+    last_download_attempt_at: datetime | None = None
+    last_error: str | None = None
+
+
+class PlaylistImportResponse(BaseModel):
+    playlists: list[PlaylistResponse]
+
+
+class PlaylistDownloadResponse(BaseModel):
+    status: str
+    playlist_id: int
+
+
 class ProxySettings(BaseModel):
     host: str = ""
     port: int = Field(default=0, ge=0, le=65535)

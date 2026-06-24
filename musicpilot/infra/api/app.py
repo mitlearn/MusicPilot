@@ -15,14 +15,14 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
-from secrets import compare_digest
+from secrets import compare_digest, token_urlsafe
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from opencc import OpenCC
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +40,19 @@ from musicpilot.adapters.metadata import (
     MusicBrainzProvider,
     MutagenTagWriter,
     NetEaseMusicProvider,
+)
+from musicpilot.adapters.music_platforms.public_playlist import (
+    PublicPlaylist,
+    PublicPlaylistImporter,
+    PublicPlaylistParseError,
+    UnsupportedPublicPlaylistURL,
+)
+from musicpilot.adapters.music_platforms.spotify import (
+    SPOTIFY_PLAYLIST_SCOPES,
+    SpotifyAPIError,
+    SpotifyClient,
+    refresh_token_expiry,
+    token_expiry,
 )
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
@@ -85,10 +98,22 @@ from musicpilot.infra.api.schemas import (
     MetadataSiteSearchRequest,
     MetadataSiteSearchResponse,
     MusicLibraryTrackResponse,
+    MusicPlatformConnectRequest,
+    MusicPlatformConnectResponse,
+    MusicPlatformResponse,
     NexusPHPParserRequest,
     NotifierCreateRequest,
     NotifierResponse,
     ParserFieldRequest,
+    PlaylistAvailableResponse,
+    PlaylistDownloadResponse,
+    PlaylistImportRequest,
+    PlaylistImportResponse,
+    PlaylistImportUrlPreviewRequest,
+    PlaylistImportUrlPreviewResponse,
+    PlaylistImportUrlRequest,
+    PlaylistResponse,
+    PlaylistTrackResponse,
     QBittorrentWebhookRequest,
     SearchRequest,
     SearchResponse,
@@ -110,7 +135,10 @@ from musicpilot.infra.db.models import (
     MediaFile,
     MediaServerConfig,
     MusicLibraryTrack,
+    MusicPlatformConnection,
     NotifierChannel,
+    Playlist,
+    PlaylistTrack,
     TorrentRecord,
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
@@ -248,6 +276,11 @@ class AppState:
                 MusicBrainzProvider(user_agent=settings.musicbrainz_user_agent),
             ]
         )
+        self.spotify = SpotifyClient()
+        self.public_playlist_importer = PublicPlaylistImporter()
+        self.oauth_states: dict[str, str] = {}
+        self.playlist_import_previews: dict[str, PublicPlaylist] = {}
+        self.playlist_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
         self.scraper = LocalMusicScraper(
             metadata=self.scraping_metadata,
@@ -477,12 +510,19 @@ def create_app() -> FastAPI:
             state.metadata_site_search_worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await state.metadata_site_search_worker
+        for task in state.playlist_download_tasks.values():
+            task.cancel()
+        for task in state.playlist_download_tasks.values():
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         for bot in state.bots:
             await bot.stop()
         state.scheduler.stop()
         await state.pipeline.stop()
         if state.downloader is not None:
             await state.downloader.close()
+        await state.spotify.close()
+        await state.public_playlist_importer.close()
         for provider in (*state.metadata.providers, *state.scraping_metadata.providers):
             close = getattr(provider, "close", None)
             if close is not None:
@@ -1030,6 +1070,335 @@ def create_app() -> FastAPI:
         state.add_log("notify", f"Telegram notifier test succeeded: {username}")
         return TestResponse(ok=True, message=f"Telegram Bot 可用：{username}")
 
+    @app.get("/api/music-platforms", response_model=list[MusicPlatformResponse])
+    async def music_platforms() -> list[MusicPlatformResponse]:
+        rows = await state.repository.list_music_platform_connections()
+        return [
+            _music_platform_response(item)
+            for item in rows
+            if item.platform != "url_import"
+        ]
+
+    @app.post(
+        "/api/music-platforms/connect/start",
+        response_model=MusicPlatformConnectResponse,
+        status_code=201,
+    )
+    async def start_music_platform_connect(
+        payload: MusicPlatformConnectRequest,
+    ) -> MusicPlatformConnectResponse:
+        connection = await state.repository.create_music_platform_connection(
+            platform=payload.platform,
+            client_id=payload.client_id.strip(),
+            client_secret=payload.client_secret.strip(),
+            redirect_uri=payload.redirect_uri.strip(),
+            scopes=list(SPOTIFY_PLAYLIST_SCOPES),
+        )
+        oauth_state = token_urlsafe(24)
+        state.oauth_states[oauth_state] = connection.id
+        authorization_url = state.spotify.authorization_url(
+            client_id=connection.client_id,
+            redirect_uri=connection.redirect_uri,
+            state=oauth_state,
+            scopes=SPOTIFY_PLAYLIST_SCOPES,
+        )
+        return MusicPlatformConnectResponse(
+            connection_id=connection.id,
+            authorization_url=authorization_url,
+        )
+
+    @app.post(
+        "/api/music-platforms/{connection_id}/reauthorize/start",
+        response_model=MusicPlatformConnectResponse,
+    )
+    async def start_music_platform_reauthorize(
+        connection_id: str,
+    ) -> MusicPlatformConnectResponse:
+        connection = await state.repository.get_music_platform_connection(connection_id)
+        if connection is None:
+            raise HTTPException(status_code=404, detail="Music platform connection not found.")
+        if connection.platform != "spotify":
+            raise HTTPException(status_code=422, detail="Unsupported music platform.")
+        oauth_state = token_urlsafe(24)
+        state.oauth_states[oauth_state] = connection.id
+        authorization_url = state.spotify.authorization_url(
+            client_id=connection.client_id,
+            redirect_uri=connection.redirect_uri,
+            state=oauth_state,
+            scopes=_spotify_authorization_scopes(connection),
+        )
+        return MusicPlatformConnectResponse(
+            connection_id=connection.id,
+            authorization_url=authorization_url,
+        )
+
+    @app.get("/api/integrations/spotify/callback", response_class=HTMLResponse)
+    async def spotify_callback(
+        code: str | None = None,
+        oauth_state: str | None = Query(default=None, alias="state"),
+        error: str | None = None,
+    ) -> HTMLResponse:
+        if error:
+            return _oauth_html("Spotify authorization failed", error, status_code=400)
+        if not code or not oauth_state:
+            return _oauth_html(
+                "Spotify authorization failed",
+                "Missing callback parameters.",
+                status_code=400,
+            )
+        connection_id = state.oauth_states.pop(oauth_state, None)
+        if connection_id is None:
+            return _oauth_html(
+                "Spotify authorization failed",
+                "Authorization state expired.",
+                status_code=400,
+            )
+        connection = await state.repository.get_music_platform_connection(connection_id)
+        if connection is None:
+            return _oauth_html(
+                "Spotify authorization failed",
+                "Music platform connection not found.",
+                status_code=404,
+            )
+        try:
+            token_payload = await state.spotify.exchange_code(
+                client_id=connection.client_id,
+                client_secret=connection.client_secret,
+                redirect_uri=connection.redirect_uri,
+                code=code,
+            )
+            access_token = str(token_payload.get("access_token") or "")
+            if not access_token:
+                raise RuntimeError("Spotify did not return an access token.")
+            refresh_token = str(
+                token_payload.get("refresh_token") or connection.refresh_token or ""
+            )
+            profile: dict[str, Any] = {}
+            profile_warning: str | None = None
+            try:
+                profile = await state.spotify.profile(access_token)
+            except Exception as exc:  # noqa: BLE001
+                profile_warning = str(exc)
+                state.add_log(
+                    "playlist",
+                    f"Spotify profile lookup skipped for {connection.id}: {exc}",
+                    "WARNING",
+                )
+            display_name = str(
+                profile.get("display_name")
+                or profile.get("id")
+                or connection.display_name
+                or "Spotify"
+            )
+            updated = await state.repository.update_music_platform_connection(
+                connection.id,
+                display_name=display_name,
+                external_user_id=_optional_string(profile.get("id")),
+                access_token=access_token,
+                refresh_token=refresh_token or None,
+                scopes=str(token_payload.get("scope") or " ".join(SPOTIFY_PLAYLIST_SCOPES)).split(),
+                status="connected",
+                access_token_expires_at=token_expiry(token_payload.get("expires_in")),
+                refresh_token_expires_at=refresh_token_expiry(),
+                last_error=profile_warning,
+                payload={"profile": profile, "profile_warning": profile_warning},
+            )
+            if updated is None:
+                raise RuntimeError("Music platform connection disappeared.")
+        except Exception as exc:  # noqa: BLE001
+            await state.repository.update_music_platform_connection(
+                connection.id,
+                status="failed",
+                last_error=str(exc),
+            )
+            return _oauth_html("Spotify authorization failed", str(exc), status_code=502)
+        return _oauth_html(
+            "Spotify connected",
+            "You can close this window and return to MusicPilot.",
+        )
+
+    @app.delete("/api/music-platforms/{connection_id}", status_code=204)
+    async def delete_music_platform(connection_id: str) -> None:
+        deleted = await state.repository.delete_music_platform_connection(connection_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Music platform connection not found.")
+
+    @app.get("/api/playlists", response_model=list[PlaylistResponse])
+    async def playlists() -> list[PlaylistResponse]:
+        rows = await state.repository.list_playlists()
+        return [await _playlist_response(state, item) for item in rows]
+
+    @app.get("/api/playlists/available", response_model=list[PlaylistAvailableResponse])
+    async def available_playlists(connection_id: str) -> list[PlaylistAvailableResponse]:
+        connection = await _connected_music_platform_or_404(state, connection_id)
+        access_token = await _spotify_access_token(state, connection)
+        try:
+            items = await state.spotify.playlists(access_token)
+        except SpotifyAPIError as exc:
+            await _mark_spotify_connection_error(state, connection.id, exc)
+            raise _spotify_http_exception(exc) from exc
+        await state.repository.update_music_platform_connection(
+            connection.id,
+            last_synced_at=datetime.now(UTC),
+            last_error=None,
+        )
+        return [_spotify_playlist_response(item) for item in items]
+
+    @app.post("/api/playlists/import", response_model=PlaylistImportResponse, status_code=201)
+    async def import_playlists(payload: PlaylistImportRequest) -> PlaylistImportResponse:
+        connection = await _connected_music_platform_or_404(state, payload.connection_id)
+        access_token = await _spotify_access_token(state, connection)
+        selected_ids = set(payload.external_ids)
+        try:
+            available = await state.spotify.playlists(access_token)
+        except SpotifyAPIError as exc:
+            await _mark_spotify_connection_error(state, connection.id, exc)
+            raise _spotify_http_exception(exc) from exc
+        by_id = {str(item.get("id") or ""): item for item in available if item.get("id")}
+        imported: list[PlaylistResponse] = []
+        for external_id in payload.external_ids:
+            item = by_id.get(external_id)
+            if item is None:
+                continue
+            playlist = await _import_spotify_playlist(state, connection, access_token, item)
+            imported.append(await _playlist_response(state, playlist))
+        if len(imported) != len(selected_ids):
+            state.add_log(
+                "playlist",
+                "Some Spotify playlists were not found during import: "
+                f"requested={len(selected_ids)}, imported={len(imported)}",
+                "WARNING",
+            )
+        return PlaylistImportResponse(playlists=imported)
+
+    @app.post(
+        "/api/playlists/parse-url",
+        response_model=list[PlaylistImportUrlPreviewResponse],
+    )
+    async def parse_playlist_url(
+        payload: PlaylistImportUrlPreviewRequest,
+    ) -> list[PlaylistImportUrlPreviewResponse]:
+        settings_payload = await state.repository.get_system_settings()
+        try:
+            parsed = await state.public_playlist_importer.parse(
+                payload.url,
+                proxy_url=_proxy_url(settings_payload),
+            )
+        except UnsupportedPublicPlaylistURL as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except PublicPlaylistParseError as exc:
+            raise HTTPException(status_code=502, detail=f"歌单解析失败：{exc}") from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"歌单页面请求失败：{exc}") from exc
+        import_token = token_urlsafe(24)
+        state.playlist_import_previews[import_token] = parsed
+        return [_playlist_url_preview_response(import_token, parsed)]
+
+    @app.post("/api/playlists/import-url", response_model=PlaylistImportResponse, status_code=201)
+    async def import_playlist_url(payload: PlaylistImportUrlRequest) -> PlaylistImportResponse:
+        import_token = payload.import_token.strip()
+        parsed = state.playlist_import_previews.pop(import_token, None) if import_token else None
+        if parsed is None:
+            url = payload.url.strip()
+            if not url:
+                raise HTTPException(status_code=409, detail="请先解析歌单链接。")
+            settings_payload = await state.repository.get_system_settings()
+            try:
+                parsed = await state.public_playlist_importer.parse(
+                    url,
+                    proxy_url=_proxy_url(settings_payload),
+                )
+            except UnsupportedPublicPlaylistURL as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except PublicPlaylistParseError as exc:
+                raise HTTPException(status_code=502, detail=f"歌单解析失败：{exc}") from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=502, detail=f"歌单页面请求失败：{exc}") from exc
+        playlist = await _import_public_playlist(state, parsed)
+        return PlaylistImportResponse(playlists=[await _playlist_response(state, playlist)])
+
+    @app.get("/api/playlists/{playlist_id}/tracks", response_model=list[PlaylistTrackResponse])
+    async def playlist_tracks(playlist_id: int) -> list[PlaylistTrackResponse]:
+        playlist = await state.repository.get_playlist(playlist_id)
+        if playlist is None:
+            raise HTTPException(status_code=404, detail="Playlist not found.")
+        tracks = await state.repository.list_playlist_tracks(playlist_id)
+        return [_playlist_track_response(item) for item in tracks]
+
+    @app.delete("/api/playlists/{playlist_id}", status_code=204)
+    async def delete_playlist(playlist_id: int) -> None:
+        task = state.playlist_download_tasks.pop(playlist_id, None)
+        if task is not None:
+            task.cancel()
+        deleted = await state.repository.delete_playlist(playlist_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Playlist not found.")
+
+    @app.post("/api/playlists/{playlist_id}/sync", response_model=PlaylistResponse)
+    async def sync_playlist(playlist_id: int) -> PlaylistResponse:
+        playlist = await state.repository.get_playlist(playlist_id)
+        if playlist is None:
+            raise HTTPException(status_code=404, detail="Playlist not found.")
+        if playlist.platform_connection_id == "url_import":
+            source_url = _optional_string(playlist.raw_payload.get("source_url"))
+            if not source_url:
+                raise HTTPException(status_code=409, detail="该歌单缺少原始链接，请重新导入。")
+            settings_payload = await state.repository.get_system_settings()
+            try:
+                parsed = await state.public_playlist_importer.parse(
+                    source_url,
+                    proxy_url=_proxy_url(settings_payload),
+                )
+            except UnsupportedPublicPlaylistURL as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except PublicPlaylistParseError as exc:
+                raise HTTPException(status_code=502, detail=f"歌单解析失败：{exc}") from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=502, detail=f"歌单页面请求失败：{exc}") from exc
+            synced = await _import_public_playlist(state, parsed)
+            return await _playlist_response(state, synced)
+        connection = await _connected_music_platform_or_404(state, playlist.platform_connection_id)
+        access_token = await _spotify_access_token(state, connection)
+        try:
+            items = await state.spotify.playlists(access_token)
+        except SpotifyAPIError as exc:
+            await _mark_spotify_connection_error(state, connection.id, exc)
+            raise _spotify_http_exception(exc) from exc
+        source = next(
+            (item for item in items if str(item.get("id") or "") == playlist.external_id),
+            None,
+        )
+        if source is None:
+            await state.repository.update_playlist(
+                playlist.id,
+                status="failed",
+                last_error="Spotify playlist not found.",
+            )
+            raise HTTPException(status_code=404, detail="Spotify playlist not found.")
+        synced = await _import_spotify_playlist(state, connection, access_token, source)
+        return await _playlist_response(state, synced)
+
+    @app.post("/api/playlists/{playlist_id}/download", response_model=PlaylistDownloadResponse)
+    async def download_playlist(playlist_id: int) -> PlaylistDownloadResponse:
+        playlist = await state.repository.get_playlist(playlist_id)
+        if playlist is None:
+            raise HTTPException(status_code=404, detail="Playlist not found.")
+        current = state.playlist_download_tasks.get(playlist_id)
+        if current is not None and not current.done():
+            return PlaylistDownloadResponse(status="running", playlist_id=playlist_id)
+        await state.repository.update_playlist(
+            playlist_id,
+            status="downloading",
+            last_download_started_at=datetime.now(UTC),
+            last_error=None,
+        )
+        task = asyncio.create_task(
+            _download_playlist_tracks(state, playlist_id),
+            name=f"musicpilot-playlist-download-{playlist_id}",
+        )
+        state.playlist_download_tasks[playlist_id] = task
+        return PlaylistDownloadResponse(status="started", playlist_id=playlist_id)
+
     @app.get("/api/logs", response_model=list[LogEntryResponse])
     async def logs(limit: int = 200) -> list[LogEntryResponse]:
         limited = max(1, min(limit, 500))
@@ -1258,6 +1627,555 @@ def create_app() -> FastAPI:
 
 def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _connected_music_platform_or_404(
+    state: AppState,
+    connection_id: str,
+) -> MusicPlatformConnection:
+    connection = await state.repository.get_music_platform_connection(connection_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Music platform connection not found.")
+    if connection.platform != "spotify":
+        raise HTTPException(status_code=422, detail="Unsupported music platform.")
+    if connection.status != "connected":
+        raise HTTPException(status_code=409, detail="Music platform requires reauthorization.")
+    return connection
+
+
+async def _spotify_access_token(state: AppState, connection: MusicPlatformConnection) -> str:
+    if connection.access_token and _future_datetime(connection.access_token_expires_at):
+        return connection.access_token
+    if not connection.refresh_token:
+        await state.repository.update_music_platform_connection(
+            connection.id,
+            status="reauthorization_required",
+            last_error="Spotify refresh token is missing.",
+        )
+        raise HTTPException(status_code=409, detail="Spotify authorization expired.")
+    try:
+        token_payload = await state.spotify.refresh_token(
+            client_id=connection.client_id,
+            client_secret=connection.client_secret,
+            refresh_token=connection.refresh_token,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await state.repository.update_music_platform_connection(
+            connection.id,
+            status="reauthorization_required",
+            last_error=str(exc),
+        )
+        raise HTTPException(status_code=409, detail="Spotify authorization expired.") from exc
+    access_token = str(token_payload.get("access_token") or "")
+    if not access_token:
+        await state.repository.update_music_platform_connection(
+            connection.id,
+            status="reauthorization_required",
+            last_error="Spotify refresh did not return an access token.",
+        )
+        raise HTTPException(status_code=409, detail="Spotify authorization expired.")
+    refresh_token = str(token_payload.get("refresh_token") or connection.refresh_token)
+    await state.repository.update_music_platform_connection(
+        connection.id,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        access_token_expires_at=token_expiry(token_payload.get("expires_in")),
+        refresh_token_expires_at=(
+            refresh_token_expiry() if refresh_token != connection.refresh_token
+            else connection.refresh_token_expires_at
+        ),
+        status="connected",
+        last_error=None,
+    )
+    return access_token
+
+
+async def _mark_spotify_connection_error(
+    state: AppState,
+    connection_id: str,
+    exc: SpotifyAPIError,
+) -> None:
+    changes: dict[str, object] = {"last_error": str(exc)}
+    if exc.status_code == 401:
+        changes["status"] = "reauthorization_required"
+    await state.repository.update_music_platform_connection(connection_id, **changes)
+
+
+def _spotify_http_exception(exc: SpotifyAPIError) -> HTTPException:
+    status_code = 502
+    if exc.status_code in {401, 403}:
+        status_code = 409
+    elif exc.status_code == 429:
+        status_code = 429
+    return HTTPException(status_code=status_code, detail=str(exc))
+
+
+def _future_datetime(value: datetime | None) -> bool:
+    if value is None:
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value > datetime.now(UTC)
+
+
+def _music_platform_response(item: MusicPlatformConnection) -> MusicPlatformResponse:
+    return MusicPlatformResponse(
+        id=item.id,
+        platform=item.platform,
+        display_name=item.display_name,
+        external_user_id=item.external_user_id,
+        status=item.status,
+        redirect_uri=item.redirect_uri,
+        scopes=list(item.scopes or []),
+        access_token_expires_at=item.access_token_expires_at,
+        refresh_token_expires_at=item.refresh_token_expires_at,
+        last_synced_at=item.last_synced_at,
+        last_error=item.last_error,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def _spotify_authorization_scopes(connection: MusicPlatformConnection) -> tuple[str, ...]:
+    scopes = list(connection.scopes or [])
+    for scope in SPOTIFY_PLAYLIST_SCOPES:
+        if scope not in scopes:
+            scopes.append(scope)
+    return tuple(scopes)
+
+
+def _spotify_playlist_response(item: dict[str, Any]) -> PlaylistAvailableResponse:
+    return PlaylistAvailableResponse(
+        external_id=str(item.get("id") or ""),
+        name=str(item.get("name") or "Spotify playlist"),
+        owner_name=_spotify_owner_name(item),
+        description=_optional_string(item.get("description")),
+        cover_url=_spotify_first_image_url(item.get("images")),
+        track_count=_spotify_playlist_track_count(item),
+        raw_payload=item,
+    )
+
+
+def _playlist_url_preview_response(
+    import_token: str,
+    item: PublicPlaylist,
+) -> PlaylistImportUrlPreviewResponse:
+    return PlaylistImportUrlPreviewResponse(
+        import_token=import_token,
+        platform=item.platform,
+        external_id=item.external_id,
+        name=item.name,
+        owner_name=item.owner_name,
+        description=item.description,
+        cover_url=item.cover_url,
+        track_count=len(item.tracks),
+    )
+
+
+async def _playlist_response(state: AppState, item: Playlist) -> PlaylistResponse:
+    counts = await state.repository.playlist_track_counts(item.id)
+    return PlaylistResponse(
+        id=item.id,
+        platform_connection_id=item.platform_connection_id,
+        platform=item.platform,
+        external_id=item.external_id,
+        name=item.name,
+        owner_name=item.owner_name,
+        description=item.description,
+        cover_url=item.cover_url,
+        track_count=counts["track_count"],
+        existing_count=counts["existing_count"],
+        waiting_count=counts["waiting_count"],
+        submitted_count=counts["submitted_count"],
+        failed_count=counts["failed_count"],
+        status=item.status,
+        last_synced_at=item.last_synced_at,
+        last_download_started_at=item.last_download_started_at,
+        last_error=item.last_error,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def _playlist_track_response(item: PlaylistTrack) -> PlaylistTrackResponse:
+    return PlaylistTrackResponse(
+        id=item.id,
+        playlist_id=item.playlist_id,
+        platform=item.platform,
+        external_id=item.external_id,
+        position=item.position,
+        title=item.title,
+        artist=item.artist,
+        album=item.album,
+        duration=item.duration,
+        isrc=item.isrc,
+        cover_url=item.cover_url,
+        exists_in_library=item.exists_in_library,
+        matched_library_track_id=item.matched_library_track_id,
+        download_status=item.download_status,
+        torrent_record_id=item.torrent_record_id,
+        last_checked_at=item.last_checked_at,
+        last_download_attempt_at=item.last_download_attempt_at,
+        last_error=item.last_error,
+    )
+
+
+async def _import_spotify_playlist(
+    state: AppState,
+    connection: MusicPlatformConnection,
+    access_token: str,
+    item: dict[str, Any],
+) -> Playlist:
+    playlist_payload = _spotify_playlist_response(item)
+    playlist = await state.repository.upsert_playlist(
+        platform_connection_id=connection.id,
+        platform=connection.platform,
+        external_id=playlist_payload.external_id,
+        name=playlist_payload.name,
+        owner_name=playlist_payload.owner_name,
+        description=playlist_payload.description,
+        cover_url=playlist_payload.cover_url,
+        track_count=playlist_payload.track_count,
+        raw_payload=item,
+    )
+    try:
+        raw_tracks = await state.spotify.playlist_tracks(access_token, playlist.external_id)
+    except SpotifyAPIError as exc:
+        await _mark_spotify_connection_error(state, connection.id, exc)
+        raise _spotify_http_exception(exc) from exc
+    tracks = [
+        _spotify_track_payload(entry, index)
+        for index, entry in enumerate(raw_tracks, start=1)
+    ]
+    await state.repository.upsert_playlist_tracks(
+        playlist_id=playlist.id,
+        platform=connection.platform,
+        tracks=[track for track in tracks if track is not None],
+    )
+    await _refresh_playlist_library_matches(state, playlist.id)
+    await state.repository.update_music_platform_connection(
+        connection.id,
+        last_synced_at=datetime.now(UTC),
+        last_error=None,
+    )
+    state.add_log("playlist", f"Spotify playlist imported: {playlist.name}")
+    return await state.repository.get_playlist(playlist.id) or playlist
+
+
+async def _import_public_playlist(state: AppState, parsed: PublicPlaylist) -> Playlist:
+    connection = await state.repository.get_or_create_url_import_connection()
+    playlist = await state.repository.upsert_playlist(
+        platform_connection_id=connection.id,
+        platform=parsed.platform,
+        external_id=parsed.external_id,
+        name=parsed.name,
+        owner_name=parsed.owner_name,
+        description=parsed.description,
+        cover_url=parsed.cover_url,
+        track_count=len(parsed.tracks),
+        raw_payload={"source_url": parsed.source_url, "payload": parsed.raw_payload},
+    )
+    await state.repository.upsert_playlist_tracks(
+        playlist_id=playlist.id,
+        platform=parsed.platform,
+        tracks=[
+            {
+                "external_id": track.external_id,
+                "position": track.position,
+                "title": track.title,
+                "artist": track.artist,
+                "album": track.album,
+                "duration": track.duration,
+                "cover_url": track.cover_url,
+                "raw_payload": track.raw_payload,
+            }
+            for track in parsed.tracks
+        ],
+    )
+    await _refresh_playlist_library_matches(state, playlist.id)
+    state.add_log(
+        "playlist",
+        f"Public playlist imported: {parsed.platform}/{parsed.external_id}, "
+        f"{len(parsed.tracks)} track(s)",
+    )
+    return await state.repository.get_playlist(playlist.id) or playlist
+
+
+def _spotify_track_payload(entry: dict[str, Any], position: int) -> dict[str, Any] | None:
+    track = entry.get("track")
+    if not isinstance(track, dict):
+        return None
+    title = str(track.get("name") or "").strip()
+    if not title:
+        return None
+    track_id = str(track.get("id") or "").strip()
+    album = track.get("album") if isinstance(track.get("album"), dict) else {}
+    external_ids = track.get("external_ids") if isinstance(track.get("external_ids"), dict) else {}
+    return {
+        "external_id": track_id or f"local:{position}:{title}",
+        "position": position,
+        "title": title,
+        "artist": _spotify_artists(track.get("artists")),
+        "album": _optional_string(album.get("name")),
+        "duration": _optional_int(track.get("duration_ms")),
+        "isrc": _optional_string(external_ids.get("isrc")),
+        "cover_url": _spotify_first_image_url(album.get("images")),
+        "raw_payload": entry,
+    }
+
+
+def _spotify_owner_name(item: dict[str, Any]) -> str | None:
+    owner = item.get("owner")
+    if not isinstance(owner, dict):
+        return None
+    return _optional_string(owner.get("display_name") or owner.get("id"))
+
+
+def _spotify_playlist_track_count(item: dict[str, Any]) -> int:
+    tracks = item.get("tracks")
+    if not isinstance(tracks, dict):
+        return 0
+    return _optional_int(tracks.get("total")) or 0
+
+
+def _spotify_first_image_url(images: object) -> str | None:
+    if not isinstance(images, list):
+        return None
+    for image in images:
+        if isinstance(image, dict):
+            url = _optional_string(image.get("url"))
+            if url:
+                return url
+    return None
+
+
+def _spotify_artists(value: object) -> str | None:
+    if not isinstance(value, list):
+        return None
+    names = [
+        str(item.get("name") or "").strip()
+        for item in value
+        if isinstance(item, dict) and item.get("name")
+    ]
+    return ", ".join(names) or None
+
+
+async def _refresh_playlist_library_matches(
+    state: AppState,
+    playlist_id: int | None = None,
+) -> int:
+    library_tracks = await state.repository.list_music_library_tracks()
+    playlist_tracks = (
+        await state.repository.list_playlist_tracks(playlist_id)
+        if playlist_id is not None
+        else await state.repository.list_all_playlist_tracks()
+    )
+    checked_at = datetime.now(UTC)
+    updated = 0
+    for track in playlist_tracks:
+        match = _match_library_track(track.title, track.artist, library_tracks)
+        exists = match is not None
+        status = "existing" if exists else track.download_status
+        await state.repository.update_playlist_track(
+            track.id,
+            exists_in_library=exists,
+            matched_library_track_id=match.id if match is not None else None,
+            download_status=status,
+            last_checked_at=checked_at,
+        )
+        updated += 1
+    return updated
+
+
+def _match_library_track(
+    title: str,
+    artist: str | None,
+    library_tracks: list[MusicLibraryTrack],
+) -> MusicLibraryTrack | None:
+    normalized_title = normalize_search_text(title)
+    normalized_artist = normalize_search_text(artist or "")
+    if not normalized_title or not normalized_artist:
+        return None
+    for item in library_tracks:
+        if normalize_search_text(item.title) != normalized_title:
+            continue
+        item_artist = normalize_search_text(item.artist or "")
+        if item_artist == normalized_artist:
+            return item
+        if item_artist and (
+            item_artist in normalized_artist or normalized_artist in item_artist
+        ):
+            return item
+    return None
+
+
+async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
+    try:
+        await _refresh_playlist_library_matches(state, playlist_id)
+        tracks = await state.repository.list_playlist_tracks(playlist_id)
+        for track in tracks:
+            if track.exists_in_library:
+                await state.repository.update_playlist_track(
+                    track.id,
+                    download_status="existing",
+                    last_error=None,
+                )
+            else:
+                await state.repository.update_playlist_track(
+                    track.id,
+                    download_status="waiting",
+                    last_error=None,
+                )
+
+        waiting_tracks = await state.repository.list_playlist_tracks(playlist_id)
+        for track in waiting_tracks:
+            if track.download_status != "waiting":
+                continue
+            await _download_playlist_track(state, track.id)
+        await state.repository.update_playlist(playlist_id, status="synced", last_error=None)
+    except Exception as exc:  # noqa: BLE001
+        await state.repository.update_playlist(playlist_id, status="failed", last_error=str(exc))
+        state.add_log("playlist", f"Playlist download failed: {playlist_id}, {exc}", "ERROR")
+    finally:
+        state.playlist_download_tasks.pop(playlist_id, None)
+
+
+async def _download_playlist_track(state: AppState, track_id: int) -> None:
+    track = await state.repository.get_playlist_track(track_id)
+    if track is None:
+        return
+    library_tracks = await state.repository.list_music_library_tracks()
+    match = _match_library_track(track.title, track.artist, library_tracks)
+    if match is not None:
+        await state.repository.update_playlist_track(
+            track.id,
+            exists_in_library=True,
+            matched_library_track_id=match.id,
+            download_status="existing",
+            last_checked_at=datetime.now(UTC),
+            last_error=None,
+        )
+        return
+    try:
+        await state.repository.update_playlist_track(
+            track.id,
+            exists_in_library=False,
+            matched_library_track_id=None,
+            download_status="searching",
+            last_checked_at=datetime.now(UTC),
+            last_download_attempt_at=datetime.now(UTC),
+            last_error=None,
+        )
+        result = await _best_playlist_download_result(state, track)
+        if result is None:
+            await state.repository.update_playlist_track(
+                track.id,
+                download_status="not_found",
+                last_error="No artist-matched torrent result found.",
+            )
+            return
+        task = await _create_and_submit_download_task(
+            state,
+            resource=_search_result_response(result).model_dump(),
+            media_metadata=_playlist_media_metadata(track),
+            selected_site_ids=[],
+            category="MusicPilot",
+        )
+        await state.repository.update_playlist_track(
+            track.id,
+            download_status="submitted",
+            torrent_record_id=task.id,
+            last_error=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await state.repository.update_playlist_track(
+            track.id,
+            download_status="failed",
+            last_error=str(exc),
+        )
+
+
+async def _best_playlist_download_result(
+    state: AppState,
+    track: PlaylistTrack,
+) -> SearchResult | None:
+    if not state.indexers:
+        return None
+    groups = await asyncio.gather(
+        *(_search_indexer(indexer, track.title, 50) for indexer in state.indexers),
+        return_exceptions=True,
+    )
+    raw_results: list[SearchResult] = []
+    for group in groups:
+        if isinstance(group, Exception):
+            state.add_log("playlist", f"Playlist track search failed: {group}", "WARNING")
+            continue
+        raw_results.extend(group[1])
+    filtered = _filter_by_artist(_dedupe_results(raw_results), track.artist)
+    ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
+    return ranked[0] if ranked else None
+
+
+async def _create_and_submit_download_task(
+    state: AppState,
+    *,
+    resource: dict[str, Any],
+    media_metadata: dict[str, Any],
+    selected_site_ids: list[str],
+    category: str,
+) -> TorrentRecord:
+    if state.downloader is None:
+        await state.reload_downloader()
+    if state.downloader is None:
+        raise RuntimeError("No downloader is configured.")
+    task = await state.repository.create_download_task(
+        resource=resource,
+        media_metadata=media_metadata,
+        selected_site_ids=selected_site_ids,
+        category=category,
+    )
+    try:
+        torrent_hash = await _submit_torrent_to_downloader(
+            state,
+            resource,
+            selected_site_ids,
+            category,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await state.repository.update_download_task(task.id, status="failed", last_error=str(exc))
+        raise
+    default_downloader = await state.repository.default_downloader()
+    changes: dict[str, object] = {
+        "status": "submitted",
+        "downloader_id": default_downloader.id if default_downloader else None,
+        "submitted_at": datetime.now(UTC),
+    }
+    if torrent_hash:
+        changes["torrent_hash"] = torrent_hash
+    updated = await state.repository.update_download_task(task.id, **changes)
+    await _send_event_notifications(state, "download", updated or task)
+    return updated or task
+
+
+def _playlist_media_metadata(track: PlaylistTrack) -> dict[str, Any]:
+    return {
+        "title": track.title,
+        "artist": track.artist,
+        "album": track.album,
+        "source": track.platform,
+        "external_id": track.external_id,
+    }
+
+
+def _oauth_html(title: str, message: str, *, status_code: int = 200) -> HTMLResponse:
+    body = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{escape(title)}</title></head>"
+        "<body style=\"font-family: sans-serif; padding: 32px;\">"
+        f"<h1>{escape(title)}</h1><p>{escape(message)}</p>"
+        "</body></html>"
+    )
+    return HTMLResponse(body, status_code=status_code)
 
 
 async def _search_indexer(
@@ -1692,6 +2610,7 @@ async def _sync_music_library_from_navidrome(state: AppState) -> int:
         return 0
     tracks = await _fetch_navidrome_music_library(server)
     count = await state.repository.sync_music_library_tracks(tracks)
+    await _refresh_playlist_library_matches(state)
     state.add_log("library", f"Music library synced: {count} track(s)")
     return count
 

@@ -186,6 +186,81 @@ type NotifierConfig = {
   enabled: boolean
 }
 
+type MusicPlatform = {
+  id: string
+  platform: string
+  display_name: string
+  external_user_id?: string | null
+  status: string
+  redirect_uri: string
+  scopes: string[]
+  access_token_expires_at?: string | null
+  refresh_token_expires_at?: string | null
+  last_synced_at?: string | null
+  last_error?: string | null
+  created_at: string
+  updated_at: string
+}
+
+type MusicPlatformConnectResponse = {
+  connection_id: string
+  authorization_url: string
+}
+
+type Playlist = {
+  id: number
+  platform_connection_id: string
+  platform: string
+  external_id: string
+  name: string
+  owner_name?: string | null
+  description?: string | null
+  cover_url?: string | null
+  track_count: number
+  existing_count: number
+  waiting_count: number
+  submitted_count: number
+  failed_count: number
+  status: string
+  last_synced_at?: string | null
+  last_download_started_at?: string | null
+  last_error?: string | null
+  created_at: string
+  updated_at: string
+}
+
+type PlaylistAvailable = {
+  import_token?: string
+  platform?: string
+  external_id: string
+  name: string
+  owner_name?: string | null
+  description?: string | null
+  cover_url?: string | null
+  track_count: number
+}
+
+type PlaylistTrack = {
+  id: number
+  playlist_id: number
+  platform: string
+  external_id: string
+  position: number
+  title: string
+  artist?: string | null
+  album?: string | null
+  duration?: number | null
+  isrc?: string | null
+  cover_url?: string | null
+  exists_in_library: boolean
+  matched_library_track_id?: number | null
+  download_status: string
+  torrent_record_id?: number | null
+  last_checked_at?: string | null
+  last_download_attempt_at?: string | null
+  last_error?: string | null
+}
+
 type SystemSettings = {
   proxy: {
     host: string
@@ -219,8 +294,8 @@ type TestResponse = {
 }
 
 type DeleteTarget = {
-  kind: 'site' | 'downloader' | 'mediaServer' | 'notifier'
-  id: string
+  kind: 'site' | 'downloader' | 'mediaServer' | 'notifier' | 'musicPlatform' | 'playlist'
+  id: string | number
   name: string
 }
 
@@ -279,11 +354,22 @@ const sites = ref<Site[]>([])
 const downloaders = ref<DownloaderConfig[]>([])
 const mediaServers = ref<MediaServerConfig[]>([])
 const notifiers = ref<NotifierConfig[]>([])
+const musicPlatforms = ref<MusicPlatform[]>([])
+const playlists = ref<Playlist[]>([])
+const availablePlaylists = ref<PlaylistAvailable[]>([])
+const selectedAvailablePlaylistIds = ref<string[]>([])
+const selectedPlaylistConnectionId = ref<string | null>(null)
+const playlistImportUrl = ref('')
+const selectedPlaylist = ref<Playlist | null>(null)
+const playlistTracks = ref<PlaylistTrack[]>([])
 
 const siteDialog = ref(false)
 const downloaderDialog = ref(false)
 const mediaServerDialog = ref(false)
 const notifierDialog = ref(false)
+const musicPlatformDialog = ref(false)
+const playlistImportDialog = ref(false)
+const playlistTracksDialog = ref(false)
 const deleteDialog = ref(false)
 const downloadDeleteDialog = ref(false)
 const mediaDeleteDialog = ref(false)
@@ -293,6 +379,11 @@ const siteTesting = ref(false)
 const downloaderTesting = ref(false)
 const mediaServerTesting = ref(false)
 const notifierTesting = ref(false)
+const musicPlatformConnecting = ref(false)
+const playlistLoading = ref(false)
+const availablePlaylistLoading = ref(false)
+const playlistTrackLoading = ref(false)
+const playlistDownloading = ref(false)
 const deleting = ref(false)
 const downloadDeleting = ref(false)
 const mediaDeleting = ref(false)
@@ -365,6 +456,13 @@ const notifierForm = ref({
   enabled: true
 })
 
+const musicPlatformForm = ref({
+  platform: 'spotify',
+  client_id: '',
+  client_secret: '',
+  redirect_uri: 'http://127.0.0.1:8000/api/integrations/spotify/callback'
+})
+
 const systemForm = ref<SystemSettings>({
   proxy: {
     host: '',
@@ -414,6 +512,7 @@ const navItems = [
   { title: '整理', value: 'media', icon: 'mdi-music-box-multiple' },
   { title: '文件管理', value: 'files', icon: 'mdi-folder-music-outline' },
   { title: '音乐库', value: 'musicLibrary', icon: 'mdi-music-circle-outline' },
+  { title: '歌单', value: 'playlists', icon: 'mdi-playlist-music-outline' },
   { title: '站点', value: 'sites', icon: 'mdi-server-network' },
   { title: '日志', value: 'logs', icon: 'mdi-text-box-search-outline' },
   { title: '设置', value: 'settings', icon: 'mdi-cog-outline' }
@@ -472,6 +571,17 @@ const musicLibraryStats = computed(() => {
     artists: artists.size
   }
 })
+
+const connectedMusicPlatforms = computed(() =>
+  musicPlatforms.value.filter((item) => item.status === 'connected')
+)
+
+const musicPlatformOptions = computed(() =>
+  connectedMusicPlatforms.value.map((item) => ({
+    title: musicPlatformLabel(item),
+    value: item.id
+  }))
+)
 
 const fileBreadcrumbs = computed(() => {
   const segments = filePath.value.split('/').filter(Boolean)
@@ -612,6 +722,7 @@ async function loadInitialData() {
     loadDownloaders(),
     loadMediaServers(),
     loadNotifiers(),
+    loadPlaylists(),
     loadSystemSettings(),
     loadMedia(),
     loadDownloads(),
@@ -831,6 +942,9 @@ function switchPage(page: string) {
   }
   if (page === 'files' && !fileEntries.value.length && !fileLoading.value) {
     void loadFiles('')
+  }
+  if (page === 'playlists' && !playlists.value.length && !playlistLoading.value) {
+    void loadPlaylists()
   }
 }
 
@@ -1126,6 +1240,207 @@ async function syncMusicLibrary() {
 
 async function loadSites() {
   sites.value = await api<Site[]>('/api/sites')
+}
+
+async function loadMusicPlatforms() {
+  musicPlatforms.value = await api<MusicPlatform[]>('/api/music-platforms')
+}
+
+async function loadPlaylists() {
+  playlistLoading.value = true
+  try {
+    playlists.value = await api<Playlist[]>('/api/playlists')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '歌单加载失败', 'error')
+  } finally {
+    playlistLoading.value = false
+  }
+}
+
+function openMusicPlatformDialog() {
+  musicPlatformForm.value = {
+    platform: 'spotify',
+    client_id: '',
+    client_secret: '',
+    redirect_uri: 'http://127.0.0.1:8000/api/integrations/spotify/callback'
+  }
+  musicPlatformDialog.value = true
+}
+
+async function connectMusicPlatform() {
+  musicPlatformConnecting.value = true
+  try {
+    const result = await api<MusicPlatformConnectResponse>('/api/music-platforms/connect/start', {
+      method: 'POST',
+      body: JSON.stringify(musicPlatformForm.value)
+    })
+    musicPlatformDialog.value = false
+    await loadMusicPlatforms()
+    window.open(result.authorization_url, '_blank', 'noopener,noreferrer')
+    notify('已打开 Spotify 授权页面，完成后请刷新音乐平台列表')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '音乐平台关联失败', 'error')
+  } finally {
+    musicPlatformConnecting.value = false
+  }
+}
+
+async function reauthorizeMusicPlatform(platform: MusicPlatform) {
+  try {
+    const result = await api<MusicPlatformConnectResponse>(
+      `/api/music-platforms/${platform.id}/reauthorize/start`,
+      { method: 'POST' }
+    )
+    window.open(result.authorization_url, '_blank', 'noopener,noreferrer')
+    notify('已打开重新登录页面，完成后请刷新音乐平台列表')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '重新登录失败', 'error')
+  }
+}
+
+function openDeleteMusicPlatform(platform: MusicPlatform) {
+  openDeleteDialog({ kind: 'musicPlatform', id: platform.id, name: musicPlatformLabel(platform) })
+}
+
+function openPlaylistImportDialog() {
+  selectedPlaylistConnectionId.value = null
+  playlistImportUrl.value = ''
+  availablePlaylists.value = []
+  selectedAvailablePlaylistIds.value = []
+  playlistImportDialog.value = true
+}
+
+async function importPlaylistUrl() {
+  const url = playlistImportUrl.value.trim()
+  if (!url) {
+    notify('请填写歌单链接', 'warning')
+    return
+  }
+  availablePlaylistLoading.value = true
+  try {
+    availablePlaylists.value = await api<PlaylistAvailable[]>('/api/playlists/parse-url', {
+      method: 'POST',
+      body: JSON.stringify({ url })
+    })
+    selectedAvailablePlaylistIds.value = availablePlaylists.value
+      .map((item) => item.import_token || item.external_id)
+      .filter(Boolean)
+    notify('歌单解析完成')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '歌单解析失败', 'error')
+  } finally {
+    availablePlaylistLoading.value = false
+  }
+}
+
+async function loadAvailablePlaylists() {
+  if (!selectedPlaylistConnectionId.value) {
+    notify('请先选择已关联平台', 'warning')
+    return
+  }
+  availablePlaylistLoading.value = true
+  try {
+    const params = new URLSearchParams({ connection_id: selectedPlaylistConnectionId.value })
+    availablePlaylists.value = await api<PlaylistAvailable[]>(`/api/playlists/available?${params}`)
+    selectedAvailablePlaylistIds.value = []
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '读取平台歌单失败', 'error')
+  } finally {
+    availablePlaylistLoading.value = false
+  }
+}
+
+async function importSelectedPlaylists() {
+  const selectedPreviewTokens = availablePlaylists.value
+    .filter((item) => item.import_token && selectedAvailablePlaylistIds.value.includes(item.import_token))
+    .map((item) => item.import_token as string)
+  if (selectedPreviewTokens.length) {
+    availablePlaylistLoading.value = true
+    try {
+      for (const importToken of selectedPreviewTokens) {
+        await api('/api/playlists/import-url', {
+          method: 'POST',
+          body: JSON.stringify({ import_token: importToken })
+        })
+      }
+      playlistImportDialog.value = false
+      playlistImportUrl.value = ''
+      availablePlaylists.value = []
+      selectedAvailablePlaylistIds.value = []
+      await loadPlaylists()
+      notify('歌单已同步')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '歌单同步失败', 'error')
+    } finally {
+      availablePlaylistLoading.value = false
+    }
+    return
+  }
+  const selectedPlatformPlaylistIds = availablePlaylists.value
+    .filter((item) => !item.import_token && selectedAvailablePlaylistIds.value.includes(item.external_id))
+    .map((item) => item.external_id)
+  if (!selectedPlaylistConnectionId.value || !selectedPlatformPlaylistIds.length) return
+  availablePlaylistLoading.value = true
+  try {
+    await api('/api/playlists/import', {
+      method: 'POST',
+      body: JSON.stringify({
+        connection_id: selectedPlaylistConnectionId.value,
+        external_ids: selectedPlatformPlaylistIds
+      })
+    })
+    playlistImportDialog.value = false
+    await loadPlaylists()
+    notify('歌单已同步')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '歌单同步失败', 'error')
+  } finally {
+    availablePlaylistLoading.value = false
+  }
+}
+
+async function viewPlaylist(playlist: Playlist) {
+  selectedPlaylist.value = playlist
+  playlistTracks.value = []
+  playlistTracksDialog.value = true
+  playlistTrackLoading.value = true
+  try {
+    playlistTracks.value = await api<PlaylistTrack[]>(`/api/playlists/${playlist.id}/tracks`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '歌单明细加载失败', 'error')
+  } finally {
+    playlistTrackLoading.value = false
+  }
+}
+
+async function syncPlaylist(playlist: Playlist) {
+  playlistLoading.value = true
+  try {
+    await api<Playlist>(`/api/playlists/${playlist.id}/sync`, { method: 'POST' })
+    await loadPlaylists()
+    notify('歌单已同步')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '歌单同步失败', 'error')
+  } finally {
+    playlistLoading.value = false
+  }
+}
+
+async function downloadPlaylist(playlist: Playlist) {
+  playlistDownloading.value = true
+  try {
+    await api(`/api/playlists/${playlist.id}/download`, { method: 'POST' })
+    await Promise.all([loadPlaylists(), loadDownloads()])
+    notify('歌单下载任务已开始')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '歌单下载失败', 'error')
+  } finally {
+    playlistDownloading.value = false
+  }
+}
+
+function openDeletePlaylist(playlist: Playlist) {
+  openDeleteDialog({ kind: 'playlist', id: playlist.id, name: playlist.name })
 }
 
 async function loadLogs() {
@@ -1474,7 +1789,9 @@ function deleteTargetLabel(target: DeleteTarget | null) {
     site: '站点',
     downloader: '下载器',
     mediaServer: '媒体服务器',
-    notifier: '通知'
+    notifier: '通知',
+    musicPlatform: '音乐平台',
+    playlist: '歌单'
   }[target.kind]
 }
 
@@ -1483,7 +1800,9 @@ function deleteTargetUrl(target: DeleteTarget) {
     site: `/api/sites/${target.id}`,
     downloader: `/api/settings/downloaders/${target.id}`,
     mediaServer: `/api/settings/media-servers/${target.id}`,
-    notifier: `/api/settings/notifiers/${target.id}`
+    notifier: `/api/settings/notifiers/${target.id}`,
+    musicPlatform: `/api/music-platforms/${target.id}`,
+    playlist: `/api/playlists/${target.id}`
   }[target.kind]
 }
 
@@ -1499,6 +1818,10 @@ async function confirmDelete() {
       downloaders.value = downloaders.value.filter((item) => item.id !== target.id)
     } else if (target.kind === 'mediaServer') {
       mediaServers.value = mediaServers.value.filter((item) => item.id !== target.id)
+    } else if (target.kind === 'musicPlatform') {
+      musicPlatforms.value = musicPlatforms.value.filter((item) => item.id !== target.id)
+    } else if (target.kind === 'playlist') {
+      playlists.value = playlists.value.filter((item) => item.id !== target.id)
     } else {
       notifiers.value = notifiers.value.filter((item) => item.id !== target.id)
     }
@@ -1566,6 +1889,82 @@ function formatDuration(value?: number | null) {
 
 function formatTime(value: string) {
   return new Date(value).toLocaleString()
+}
+
+function formatOptionalTime(value?: string | null) {
+  return value ? formatTime(value) : '-'
+}
+
+function musicPlatformLabel(platform: MusicPlatform) {
+  return `${platform.platform === 'spotify' ? 'Spotify' : platform.platform}${platform.display_name ? ` - ${platform.display_name}` : ''}`
+}
+
+function playlistPlatformLabel(platform: string) {
+  return {
+    spotify: 'Spotify',
+    spotify_public: 'Spotify',
+    qq: 'QQ音乐',
+    netease: '网易云音乐',
+    kuwo: '酷我音乐',
+    kugou: '酷狗音乐'
+  }[platform] ?? platform
+}
+
+function musicPlatformStatusText(status: string) {
+  return {
+    pending: '待授权',
+    connected: '已关联',
+    reauthorization_required: '需要重新登录',
+    failed: '关联失败'
+  }[status] ?? status
+}
+
+function musicPlatformStatusColor(status: string) {
+  return {
+    pending: 'warning',
+    connected: 'success',
+    reauthorization_required: 'error',
+    failed: 'error'
+  }[status] ?? 'secondary'
+}
+
+function playlistStatusText(status: string) {
+  return {
+    synced: '已同步',
+    downloading: '下载中',
+    failed: '失败'
+  }[status] ?? status
+}
+
+function playlistStatusColor(status: string) {
+  return {
+    synced: 'success',
+    downloading: 'info',
+    failed: 'error'
+  }[status] ?? 'secondary'
+}
+
+function playlistTrackStatusText(status: string) {
+  return {
+    pending: '待处理',
+    existing: '已存在',
+    waiting: '等待',
+    searching: '搜索中',
+    submitted: '已提交',
+    not_found: '未找到',
+    failed: '失败'
+  }[status] ?? status
+}
+
+function playlistTrackStatusColor(status: string) {
+  return {
+    existing: 'success',
+    waiting: 'warning',
+    searching: 'info',
+    submitted: 'primary',
+    not_found: 'error',
+    failed: 'error'
+  }[status] ?? 'secondary'
 }
 
 function mediaStatusColor(status: string) {
@@ -2138,6 +2537,110 @@ onUnmounted(() => {
             </v-card>
           </section>
 
+          <section v-if="activePage === 'playlists'" class="page-stack">
+            <div class="toolbar-row">
+              <v-btn color="primary" prepend-icon="mdi-plus" @click="openPlaylistImportDialog">
+                新增
+              </v-btn>
+              <v-btn
+                prepend-icon="mdi-refresh"
+                variant="tonal"
+                :loading="playlistLoading"
+                @click="loadPlaylists"
+              >
+                刷新
+              </v-btn>
+            </div>
+            <v-card>
+              <v-progress-linear v-if="playlistLoading" indeterminate color="primary" />
+              <v-table>
+                <thead>
+                  <tr>
+                    <th>歌单</th>
+                    <th>平台</th>
+                    <th>歌曲</th>
+                    <th>已存在</th>
+                    <th>等待</th>
+                    <th>已提交</th>
+                    <th>失败</th>
+                    <th>状态</th>
+                    <th>最近同步</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="!playlists.length">
+                    <td colspan="10" class="empty-cell">暂无歌单</td>
+                  </tr>
+                  <tr v-for="playlist in playlists" :key="playlist.id">
+                    <td>
+                      <div class="playlist-title-cell">
+                        <img
+                          v-if="playlist.cover_url"
+                          :src="playlist.cover_url"
+                          alt=""
+                          class="playlist-cover"
+                          loading="lazy"
+                        />
+                        <div>
+                          <div>{{ playlist.name }}</div>
+                          <div class="muted">{{ playlist.owner_name || '-' }}</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td>{{ playlistPlatformLabel(playlist.platform) }}</td>
+                    <td>{{ playlist.track_count }}</td>
+                    <td>{{ playlist.existing_count }}</td>
+                    <td>{{ playlist.waiting_count }}</td>
+                    <td>{{ playlist.submitted_count }}</td>
+                    <td>{{ playlist.failed_count }}</td>
+                    <td>
+                      <v-chip :color="playlistStatusColor(playlist.status)" size="small" variant="tonal">
+                        {{ playlistStatusText(playlist.status) }}
+                      </v-chip>
+                    </td>
+                    <td>{{ formatOptionalTime(playlist.last_synced_at) }}</td>
+                    <td>
+                      <v-btn
+                        icon="mdi-eye-outline"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="查看"
+                        @click="viewPlaylist(playlist)"
+                      />
+                      <v-btn
+                        icon="mdi-sync"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="同步"
+                        @click="syncPlaylist(playlist)"
+                      />
+                      <v-btn
+                        icon="mdi-download"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="下载"
+                        :loading="playlistDownloading"
+                        @click="downloadPlaylist(playlist)"
+                      />
+                      <v-btn
+                        icon="mdi-delete-outline"
+                        color="error"
+                        variant="text"
+                        size="small"
+                        title="删除"
+                        @click="openDeletePlaylist(playlist)"
+                      />
+                    </td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </v-card>
+          </section>
+
           <section v-if="activePage === 'sites'" class="page-stack">
             <div class="toolbar-row">
               <v-btn color="primary" prepend-icon="mdi-plus" @click="openNewSiteDialog">新增站点</v-btn>
@@ -2573,6 +3076,174 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="musicPlatformDialog" max-width="620">
+      <v-card title="关联音乐平台">
+        <v-card-text class="dialog-stack">
+          <v-select
+            v-model="musicPlatformForm.platform"
+            :items="[{ title: 'Spotify', value: 'spotify' }]"
+            label="平台"
+          />
+          <v-text-field v-model="musicPlatformForm.client_id" label="Client ID" />
+          <v-text-field
+            v-model="musicPlatformForm.client_secret"
+            label="Client Secret"
+            type="password"
+          />
+          <v-text-field v-model="musicPlatformForm.redirect_uri" label="Redirect URI" />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="musicPlatformConnecting" @click="musicPlatformDialog = false">
+            取消
+          </v-btn>
+          <v-btn color="primary" :loading="musicPlatformConnecting" @click="connectMusicPlatform">
+            下一步
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="playlistImportDialog" max-width="760">
+      <v-card title="导入歌单">
+        <v-card-text class="dialog-stack">
+          <div class="toolbar-row">
+            <v-text-field
+              v-model="playlistImportUrl"
+              label="歌单链接"
+              hide-details
+              class="platform-select"
+              @keyup.enter="importPlaylistUrl"
+            />
+            <v-btn
+              prepend-icon="mdi-link-variant-plus"
+              color="primary"
+              :loading="availablePlaylistLoading"
+              :disabled="!playlistImportUrl.trim()"
+              @click="importPlaylistUrl"
+            >
+              解析
+            </v-btn>
+          </div>
+          <v-table>
+            <thead>
+              <tr>
+                <th class="select-cell"></th>
+                <th>封面</th>
+                <th>歌单</th>
+                <th>平台</th>
+                <th>歌曲数</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!availablePlaylists.length">
+                <td colspan="5" class="empty-cell">请输入歌单链接并解析</td>
+              </tr>
+              <tr v-for="playlist in availablePlaylists" :key="playlist.import_token || playlist.external_id">
+                <td class="select-cell">
+                  <v-checkbox
+                    v-model="selectedAvailablePlaylistIds"
+                    :value="playlist.import_token || playlist.external_id"
+                    density="compact"
+                    hide-details
+                  />
+                </td>
+                <td>
+                  <v-img
+                    v-if="playlist.cover_url"
+                    :src="playlist.cover_url"
+                    width="48"
+                    height="48"
+                    cover
+                    class="playlist-cover"
+                  />
+                  <div v-else class="playlist-cover playlist-cover-placeholder">-</div>
+                </td>
+                <td>
+                  <div class="font-weight-medium">{{ playlist.name }}</div>
+                  <div class="muted-text">{{ playlist.owner_name || '-' }}</div>
+                </td>
+                <td>{{ playlist.platform || '-' }}</td>
+                <td>{{ playlist.track_count }}</td>
+              </tr>
+            </tbody>
+          </v-table>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="availablePlaylistLoading" @click="playlistImportDialog = false">
+            取消
+          </v-btn>
+          <v-btn
+            color="primary"
+            :loading="availablePlaylistLoading"
+            :disabled="!selectedAvailablePlaylistIds.length"
+            @click="importSelectedPlaylists"
+          >
+            确认同步
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="playlistTracksDialog" max-width="980">
+      <v-card :title="selectedPlaylist ? selectedPlaylist.name : '歌单明细'">
+        <v-card-text>
+          <v-progress-linear v-if="playlistTrackLoading" indeterminate color="primary" />
+          <v-table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>歌曲</th>
+                <th>艺人</th>
+                <th>专辑</th>
+                <th>时长</th>
+                <th>音乐库</th>
+                <th>下载状态</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!playlistTracks.length && !playlistTrackLoading">
+                <td colspan="8" class="empty-cell">暂无歌曲</td>
+              </tr>
+              <tr v-for="track in playlistTracks" :key="track.id">
+                <td>{{ track.position }}</td>
+                <td>{{ track.title }}</td>
+                <td>{{ track.artist || '-' }}</td>
+                <td>{{ track.album || '-' }}</td>
+                <td>{{ formatDuration(track.duration ? Math.round(track.duration / 1000) : null) }}</td>
+                <td>
+                  <v-icon
+                    v-if="track.exists_in_library"
+                    icon="mdi-check-circle"
+                    color="success"
+                    size="22"
+                    title="已存在"
+                  />
+                  <span v-else>-</span>
+                </td>
+                <td>
+                  <v-chip
+                    :color="playlistTrackStatusColor(track.download_status)"
+                    size="small"
+                    variant="tonal"
+                  >
+                    {{ playlistTrackStatusText(track.download_status) }}
+                  </v-chip>
+                </td>
+                <td>{{ track.last_error || '-' }}</td>
+              </tr>
+            </tbody>
+          </v-table>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="playlistTracksDialog = false">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="siteDialog" max-width="820">
       <v-card :title="editingSiteId ? '编辑站点' : '新增站点'">
         <v-card-text class="dialog-stack">
@@ -2865,6 +3536,40 @@ onUnmounted(() => {
 .music-library-search {
   max-width: 360px;
   min-width: 240px;
+}
+
+.platform-select {
+  max-width: 360px;
+  min-width: 260px;
+}
+
+.playlist-title-cell {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  min-width: 260px;
+}
+
+.playlist-cover {
+  aspect-ratio: 1;
+  border-radius: 6px;
+  height: 44px;
+  object-fit: cover;
+  width: 44px;
+}
+
+.playlist-cover-placeholder {
+  align-items: center;
+  background: rgba(var(--v-theme-on-surface), 0.08);
+  color: rgba(var(--v-theme-on-surface), 0.54);
+  display: flex;
+  justify-content: center;
+}
+
+.muted-text {
+  color: rgba(var(--v-theme-on-surface), 0.62);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .select-cell {

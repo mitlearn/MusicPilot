@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from musicpilot.infra.db.models import (
     DownloaderConfig,
@@ -14,7 +14,10 @@ from musicpilot.infra.db.models import (
     MediaFile,
     MediaServerConfig,
     MusicLibraryTrack,
+    MusicPlatformConnection,
     NotifierChannel,
+    Playlist,
+    PlaylistTrack,
     Subscription,
     SystemSetting,
     TorrentRecord,
@@ -374,6 +377,262 @@ class SqlAlchemyMediaRepository:
             await session.delete(row)
             await session.commit()
             return True
+
+    async def list_music_platform_connections(self) -> list[MusicPlatformConnection]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MusicPlatformConnection).order_by(
+                    MusicPlatformConnection.platform,
+                    MusicPlatformConnection.display_name,
+                )
+            )
+            return list(result.scalars().all())
+
+    async def get_music_platform_connection(
+        self,
+        connection_id: str,
+    ) -> MusicPlatformConnection | None:
+        async with self.database.session() as session:
+            return await session.get(MusicPlatformConnection, connection_id)
+
+    async def create_music_platform_connection(
+        self,
+        *,
+        platform: str,
+        client_id: str,
+        client_secret: str,
+        redirect_uri: str,
+        scopes: list[str],
+    ) -> MusicPlatformConnection:
+        async with self.database.session() as session:
+            row = MusicPlatformConnection(
+                platform=platform,
+                display_name="",
+                client_id=client_id,
+                client_secret=client_secret,
+                redirect_uri=redirect_uri,
+                scopes=scopes,
+                status="pending",
+                payload={},
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def get_or_create_url_import_connection(self) -> MusicPlatformConnection:
+        async with self.database.session() as session:
+            row = await session.get(MusicPlatformConnection, "url_import")
+            if row is None:
+                row = MusicPlatformConnection(
+                    id="url_import",
+                    platform="url_import",
+                    display_name="公开链接导入",
+                    client_id="",
+                    client_secret="",
+                    redirect_uri="",
+                    scopes=[],
+                    status="connected",
+                    payload={},
+                )
+                session.add(row)
+            else:
+                row.status = "connected"
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def update_music_platform_connection(
+        self,
+        connection_id: str,
+        **changes: Any,
+    ) -> MusicPlatformConnection | None:
+        async with self.database.session() as session:
+            row = await session.get(MusicPlatformConnection, connection_id)
+            if row is None:
+                return None
+            for key, value in changes.items():
+                setattr(row, key, value)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def delete_music_platform_connection(self, connection_id: str) -> bool:
+        async with self.database.session() as session:
+            row = await session.get(MusicPlatformConnection, connection_id)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
+
+    async def list_playlists(self) -> list[Playlist]:
+        async with self.database.session() as session:
+            result = await session.execute(select(Playlist).order_by(Playlist.updated_at.desc()))
+            return list(result.scalars().all())
+
+    async def get_playlist(self, playlist_id: int) -> Playlist | None:
+        async with self.database.session() as session:
+            return await session.get(Playlist, playlist_id)
+
+    async def delete_playlist(self, playlist_id: int) -> bool:
+        async with self.database.session() as session:
+            row = await session.get(Playlist, playlist_id)
+            if row is None:
+                return False
+            await session.execute(
+                delete(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist_id)
+            )
+            await session.delete(row)
+            await session.commit()
+            return True
+
+    async def update_playlist(self, playlist_id: int, **changes: Any) -> Playlist | None:
+        async with self.database.session() as session:
+            row = await session.get(Playlist, playlist_id)
+            if row is None:
+                return None
+            for key, value in changes.items():
+                setattr(row, key, value)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def upsert_playlist(
+        self,
+        *,
+        platform_connection_id: str,
+        platform: str,
+        external_id: str,
+        name: str,
+        owner_name: str | None,
+        description: str | None,
+        cover_url: str | None,
+        track_count: int,
+        raw_payload: dict[str, Any],
+    ) -> Playlist:
+        synced_at = datetime.now(UTC)
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(Playlist).where(
+                    Playlist.platform_connection_id == platform_connection_id,
+                    Playlist.external_id == external_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = Playlist(
+                    platform_connection_id=platform_connection_id,
+                    platform=platform,
+                    external_id=external_id,
+                    name=name,
+                )
+                session.add(row)
+            row.name = name
+            row.owner_name = owner_name
+            row.description = description
+            row.cover_url = cover_url
+            row.track_count = track_count
+            row.status = "synced"
+            row.last_synced_at = synced_at
+            row.last_error = None
+            row.raw_payload = raw_payload
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_playlist_tracks(self, playlist_id: int) -> list[PlaylistTrack]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack)
+                .where(PlaylistTrack.playlist_id == playlist_id)
+                .order_by(PlaylistTrack.position, PlaylistTrack.id)
+            )
+            return list(result.scalars().all())
+
+    async def list_all_playlist_tracks(self) -> list[PlaylistTrack]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack).order_by(PlaylistTrack.playlist_id, PlaylistTrack.position)
+            )
+            return list(result.scalars().all())
+
+    async def get_playlist_track(self, track_id: int) -> PlaylistTrack | None:
+        async with self.database.session() as session:
+            return await session.get(PlaylistTrack, track_id)
+
+    async def upsert_playlist_tracks(
+        self,
+        *,
+        playlist_id: int,
+        platform: str,
+        tracks: list[dict[str, Any]],
+    ) -> list[PlaylistTrack]:
+        seen_external_ids = {str(item["external_id"]) for item in tracks}
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist_id)
+            )
+            existing = {item.external_id: item for item in result.scalars().all()}
+            rows: list[PlaylistTrack] = []
+            for item in tracks:
+                external_id = str(item["external_id"])
+                row = existing.get(external_id)
+                if row is None:
+                    row = PlaylistTrack(
+                        playlist_id=playlist_id,
+                        platform=platform,
+                        external_id=external_id,
+                        title=str(item["title"]),
+                    )
+                    session.add(row)
+                row.position = int(item.get("position") or 0)
+                row.title = str(item.get("title") or "")
+                row.artist = _optional_string(item.get("artist"))
+                row.album = _optional_string(item.get("album"))
+                row.duration = _optional_int(item.get("duration"))
+                row.isrc = _optional_string(item.get("isrc"))
+                row.cover_url = _optional_string(item.get("cover_url"))
+                row.raw_payload = dict(item.get("raw_payload") or {})
+                rows.append(row)
+            for external_id, row in existing.items():
+                if external_id not in seen_external_ids:
+                    await session.delete(row)
+            await session.commit()
+            for row in rows:
+                await session.refresh(row)
+            return rows
+
+    async def update_playlist_track(self, track_id: int, **changes: Any) -> PlaylistTrack | None:
+        async with self.database.session() as session:
+            row = await session.get(PlaylistTrack, track_id)
+            if row is None:
+                return None
+            for key, value in changes.items():
+                setattr(row, key, value)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def playlist_track_counts(self, playlist_id: int) -> dict[str, int]:
+        tracks = await self.list_playlist_tracks(playlist_id)
+        counts: dict[str, int] = {
+            "track_count": len(tracks),
+            "existing_count": 0,
+            "waiting_count": 0,
+            "submitted_count": 0,
+            "failed_count": 0,
+        }
+        for track in tracks:
+            if track.exists_in_library or track.download_status == "existing":
+                counts["existing_count"] += 1
+            if track.download_status == "waiting":
+                counts["waiting_count"] += 1
+            if track.download_status == "submitted":
+                counts["submitted_count"] += 1
+            if track.download_status in {"failed", "not_found"}:
+                counts["failed_count"] += 1
+        return counts
 
     async def list_subscriptions(self) -> list[Subscription]:
         async with self.database.session() as session:

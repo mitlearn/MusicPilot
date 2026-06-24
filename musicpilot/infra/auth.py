@@ -28,7 +28,11 @@ def clear_session(response: Response) -> None:
 
 
 def require_session(request: Request) -> None:
-    if request.url.path in {"/api/health", "/api/auth/login"}:
+    if request.url.path in {
+        "/api/health",
+        "/api/auth/login",
+        "/api/integrations/spotify/callback",
+    }:
         return
     token = request.cookies.get(SESSION_COOKIE)
     if token is None or not _is_valid(token, request.app.state.musicpilot.settings.session_secret):

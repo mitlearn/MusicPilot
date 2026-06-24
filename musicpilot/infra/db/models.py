@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -92,6 +92,90 @@ class MusicLibraryTrack(TimestampMixin, Base):
     content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MusicPlatformConnection(TimestampMixin, Base):
+    __tablename__ = "music_platform_connections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid4().hex)
+    platform: Mapped[str] = mapped_column(String(64))
+    display_name: Mapped[str] = mapped_column(String(256), default="")
+    external_user_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    client_id: Mapped[str] = mapped_column(Text)
+    client_secret: Mapped[str] = mapped_column(Text)
+    redirect_uri: Mapped[str] = mapped_column(Text)
+    access_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(64), default="pending")
+    access_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    refresh_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class Playlist(TimestampMixin, Base):
+    __tablename__ = "playlists"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    platform_connection_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("music_platform_connections.id", ondelete="CASCADE"),
+        index=True,
+    )
+    platform: Mapped[str] = mapped_column(String(64))
+    external_id: Mapped[str] = mapped_column(String(256), index=True)
+    name: Mapped[str] = mapped_column(String(512))
+    owner_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cover_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    track_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(64), default="synced")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_download_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class PlaylistTrack(TimestampMixin, Base):
+    __tablename__ = "playlist_tracks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    playlist_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("playlists.id", ondelete="CASCADE"),
+        index=True,
+    )
+    platform: Mapped[str] = mapped_column(String(64))
+    external_id: Mapped[str] = mapped_column(String(256), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str] = mapped_column(String(512))
+    artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    album: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    isrc: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cover_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    exists_in_library: Mapped[bool] = mapped_column(Boolean, default=False)
+    matched_library_track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    download_status: Mapped[str] = mapped_column(String(64), default="pending")
+    torrent_record_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_download_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class Subscription(TimestampMixin, Base):
