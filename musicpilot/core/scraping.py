@@ -944,8 +944,10 @@ def _metadata_for_matching(
 
     # Fall back to directory-inferred metadata
     if dir_meta is not None and (dir_meta.artist or dir_meta.album):
+        # Use title from dir_meta (track prefix stripped) or strip it from source
+        inferred_title = dir_meta.title or _strip_track_prefix(metadata.title) or metadata.title
         return TrackMetadata(
-            title=metadata.title,
+            title=inferred_title,
             artist=dir_meta.artist,
             album=dir_meta.album or metadata.album,
             year=metadata.year,
