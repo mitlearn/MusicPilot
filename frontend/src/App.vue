@@ -373,6 +373,7 @@ const musicLibraryQuery = ref('')
 const musicLibraryLoading = ref(false)
 let logTimer: number | undefined
 let downloadTimer: number | undefined
+let artistBuildTimer: number | undefined
 let metadataSearchStream: EventSource | undefined
 
 const downloads = ref<DownloadTask[]>([])
@@ -786,6 +787,8 @@ async function loadInitialData() {
   ])
   startLogPolling()
   startDownloadPolling()
+  startArtistBuildPolling()
+  void loadArtistBuildStatus()
   subscribeMetadataSiteSearch()
 }
 
@@ -1316,6 +1319,15 @@ async function loadArtists() {
   artists.value = await api<Artist[]>('/api/artists')
 }
 
+async function loadArtistBuildStatus() {
+  try {
+    const status = await api<{ running: boolean }>('/api/artists/build-status')
+    artistBuilding.value = status.running
+  } catch {
+    // Silently ignore — visible errors handled by manual actions
+  }
+}
+
 async function buildArtistLibrary() {
   artistBuilding.value = true
   try {
@@ -1650,6 +1662,13 @@ function startDownloadPolling() {
     void loadDownloads().catch(() => {
       // Keep polling quiet; visible errors are handled by manual refresh and page load.
     })
+  }, 5000)
+}
+
+function startArtistBuildPolling() {
+  window.clearInterval(artistBuildTimer)
+  artistBuildTimer = window.setInterval(() => {
+    void loadArtistBuildStatus()
   }, 5000)
 }
 
@@ -2234,6 +2253,7 @@ onMounted(async () => {
 onUnmounted(() => {
   window.clearInterval(logTimer)
   window.clearInterval(downloadTimer)
+  window.clearInterval(artistBuildTimer)
   metadataSearchStream?.close()
 })
 </script>

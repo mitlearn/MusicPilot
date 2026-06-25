@@ -526,6 +526,10 @@ class BuildArtistLibraryResponse(BaseModel):
     created: int
 
 
+class ArtistBuildStatusResponse(BaseModel):
+    running: bool
+
+
 class ClearArtistLibraryResponse(BaseModel):
     deleted_artists: int
     deleted_aliases: int

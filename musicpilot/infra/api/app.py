@@ -74,6 +74,7 @@ from musicpilot.core.scraping import (
 from musicpilot.infra.api.schemas import (
     AddArtistAliasRequest,
     ArtistAliasResponse,
+    ArtistBuildStatusResponse,
     ArtistResponse,
     BuildArtistLibraryResponse,
     ClearArtistLibraryResponse,
@@ -1830,6 +1831,10 @@ def create_app() -> FastAPI:
                 )
             )
         return result
+
+    @app.get("/api/artists/build-status", response_model=ArtistBuildStatusResponse)
+    async def artist_build_status() -> ArtistBuildStatusResponse:
+        return ArtistBuildStatusResponse(running=state.artist_build_lock.locked())
 
     @app.post("/api/artists/build-library", response_model=BuildArtistLibraryResponse)
     async def build_artist_library() -> BuildArtistLibraryResponse:
