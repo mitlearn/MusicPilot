@@ -7,7 +7,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 
 from opencc import OpenCC
 
@@ -149,6 +149,7 @@ class LocalMusicScraper:
         library_tracks: tuple[LibraryTrackSnapshot, ...] = (),
         media_history: tuple[LibraryTrackSnapshot, ...] = (),
         cached_metadata: dict[Path, tuple[TrackMetadata, ...]] | None = None,
+        on_file_result: Callable[[ScrapingFileResult], Awaitable[None]] | None = None,
     ) -> ScrapingSummary:
         if not config.enabled:
             return ScrapingSummary()
@@ -211,6 +212,8 @@ class LocalMusicScraper:
             mapped_files += mapped
             updated_files += updated
             moved_files += moved
+            if on_file_result is not None:
+                await on_file_result(result)
 
         return ScrapingSummary(
             source_files=len(audio_files),

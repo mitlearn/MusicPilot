@@ -103,6 +103,7 @@ class DownloadResponse(BaseModel):
 DownloadDeleteMode = Literal["record_only", "all"]
 MediaDeleteMode = Literal["record_only", "media_file", "all"]
 FileEntryType = Literal["file", "directory"]
+FileRootType = Literal["source", "mapped"]
 
 
 class DownloadTaskResponse(BaseModel):
@@ -151,6 +152,7 @@ class FileListResponse(BaseModel):
 
 class FileOrganizeRequest(BaseModel):
     path: str = ""
+    paths: list[str] = Field(default_factory=list)
 
 
 class FileOrganizeResponse(BaseModel):
@@ -164,6 +166,7 @@ class FileOrganizeResponse(BaseModel):
 
 class FileBulkDeleteRequest(BaseModel):
     paths: list[str] = Field(min_length=1)
+    root_type: FileRootType = "source"
 
 
 class FileBulkDeleteFailure(BaseModel):

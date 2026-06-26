@@ -121,6 +121,8 @@ type FileEntry = {
   modified_at?: string | null
 }
 
+type FileRootType = 'source' | 'mapped'
+
 type FileListResponse = {
   root: string
   path: string
@@ -395,6 +397,7 @@ const musicLibraryLoading = ref(false)
 let logTimer: number | undefined
 let downloadTimer: number | undefined
 let artistBuildTimer: number | undefined
+let mediaRefreshTimer: number | undefined
 let metadataSearchStream: EventSource | undefined
 
 const downloads = ref<DownloadTask[]>([])
@@ -407,6 +410,18 @@ const mediaPage = ref(1)
 const mediaPageSize = ref(20)
 const mediaTotal = ref(0)
 const selectedMediaIds = ref<number[]>([])
+const mediaTableHeaders = [
+  { title: '', key: 'select', sortable: false, width: 48 },
+  { title: '标题', key: 'title', sortable: false, width: 160 },
+  { title: '艺人', key: 'artist', sortable: false, width: 150 },
+  { title: '专辑', key: 'album', sortable: false, width: 320 },
+  { title: '操作时间', key: 'operation_time', sortable: false, width: 180 },
+  { title: '状态', key: 'status', sortable: false, width: 90 },
+  { title: '文件路径', key: 'path', sortable: false, width: 520 },
+  { title: '备注', key: 'remark', sortable: false, width: 180 },
+  { title: '操作', key: 'actions', sortable: false, width: 80 },
+]
+const fileRootType = ref<FileRootType>('source')
 const fileEntries = ref<FileEntry[]>([])
 const selectedFilePaths = ref<string[]>([])
 const filePath = ref('')
@@ -493,6 +508,10 @@ const pendingMediaDelete = ref<MediaFile | null>(null)
 const pendingMediaDeleteIds = ref<number[]>([])
 const pendingMediaDeleteLabel = ref('')
 const pendingFileOrganize = ref<FileEntry | null>(null)
+const pendingFileOrganizePaths = ref<string[]>([])
+const pendingFileOrganizeLabel = ref('')
+const pendingFileOrganizeHasDirectory = ref(false)
+const pendingFileDeleteRootType = ref<FileRootType>('source')
 const pendingFileDeletePaths = ref<string[]>([])
 const pendingFileDeleteLabel = ref('')
 const pendingFileDeleteHasDirectory = ref(false)
@@ -598,6 +617,11 @@ const duplicateHandlingOptions = [
   { title: '保留最大文件', value: 'keep_largest' }
 ]
 
+const fileRootTypeOptions = [
+  { title: '源文件', value: 'source' },
+  { title: '映射目录', value: 'mapped' }
+]
+
 const playlistTrackDownloadStatusOptions = [
   { title: '全部下载状态', value: '' },
   { title: '等待', value: 'waiting' },
@@ -672,7 +696,8 @@ const musicPlatformOptions = computed(() =>
 
 const fileBreadcrumbs = computed(() => {
   const segments = filePath.value.split('/').filter(Boolean)
-  const items = [{ title: '源目录', path: '' }]
+  const rootTitle = fileRootType.value === 'mapped' ? '映射目录' : '源目录'
+  const items = [{ title: rootTitle, path: '' }]
   let current = ''
   for (const segment of segments) {
     current = current ? `${current}/${segment}` : segment
@@ -1240,6 +1265,7 @@ async function loadFiles(path = filePath.value) {
   try {
     const search = trimmedInput(fileSearchQuery.value)
     const params = new URLSearchParams()
+    params.set('root_type', fileRootType.value)
     if (path) params.set('path', path)
     if (search) {
       params.set('query', search)
@@ -1277,11 +1303,30 @@ function clearFileSearch() {
 }
 
 function openFileOrganize(entry: FileEntry) {
+  if (fileRootType.value !== 'source') return
   pendingFileOrganize.value = entry
+  pendingFileOrganizePaths.value = [entry.path]
+  pendingFileOrganizeLabel.value = `“${entry.name}”`
+  pendingFileOrganizeHasDirectory.value = entry.type === 'directory'
+  fileOrganizeDialog.value = true
+}
+
+function organizeSelectedFiles() {
+  if (fileRootType.value !== 'source') return
+  const paths = [...selectedFilePaths.value]
+  if (!paths.length) return
+  const selected = new Set(paths)
+  pendingFileOrganize.value = null
+  pendingFileOrganizePaths.value = paths
+  pendingFileOrganizeLabel.value = `选中的 ${paths.length} 个项目`
+  pendingFileOrganizeHasDirectory.value = fileEntries.value.some(
+    (item) => selected.has(item.path) && item.type === 'directory'
+  )
   fileOrganizeDialog.value = true
 }
 
 function openFileDelete(entry: FileEntry) {
+  pendingFileDeleteRootType.value = fileRootType.value
   pendingFileDeletePaths.value = [entry.path]
   pendingFileDeleteLabel.value = `“${entry.name}”`
   pendingFileDeleteHasDirectory.value = entry.type === 'directory'
@@ -1292,6 +1337,7 @@ function deleteSelectedFiles() {
   const paths = [...selectedFilePaths.value]
   if (!paths.length) return
   const selected = new Set(paths)
+  pendingFileDeleteRootType.value = fileRootType.value
   pendingFileDeletePaths.value = paths
   pendingFileDeleteLabel.value = `选中的 ${paths.length} 个项目`
   pendingFileDeleteHasDirectory.value = fileEntries.value.some(
@@ -1307,7 +1353,7 @@ async function confirmFileDelete() {
   try {
     const result = await api<FileBulkDeleteResponse>('/api/files', {
       method: 'DELETE',
-      body: JSON.stringify({ paths })
+      body: JSON.stringify({ paths, root_type: pendingFileDeleteRootType.value })
     })
     selectedFilePaths.value = selectedFilePaths.value.filter((item) => !paths.includes(item))
     pendingFileDeletePaths.value = []
@@ -1337,16 +1383,29 @@ async function confirmFileDelete() {
 }
 
 async function confirmFileOrganize() {
-  const entry = pendingFileOrganize.value
-  if (!entry) return
+  const paths = [...pendingFileOrganizePaths.value]
+  if (!paths.length) return
+  if (fileRootType.value !== 'source') {
+    fileOrganizeDialog.value = false
+    pendingFileOrganize.value = null
+    pendingFileOrganizePaths.value = []
+    pendingFileOrganizeLabel.value = ''
+    pendingFileOrganizeHasDirectory.value = false
+    return
+  }
   fileOrganizing.value = true
+  startMediaRefreshPolling()
   try {
     const summary = await api<FileOrganizeResponse>('/api/files/organize', {
       method: 'POST',
-      body: JSON.stringify({ path: entry.path })
+      body: JSON.stringify({ paths })
     })
     fileOrganizeDialog.value = false
     pendingFileOrganize.value = null
+    pendingFileOrganizePaths.value = []
+    pendingFileOrganizeLabel.value = ''
+    pendingFileOrganizeHasDirectory.value = false
+    selectedFilePaths.value = selectedFilePaths.value.filter((item) => !paths.includes(item))
     await Promise.all([loadFiles(filePath.value), loadMedia()])
     notify(
       `整理完成：文件 ${summary.source_files}，成功 ${summary.source_files - summary.failed_files - summary.skipped_files}，失败 ${summary.failed_files}，跳过 ${summary.skipped_files}`
@@ -1355,7 +1414,34 @@ async function confirmFileOrganize() {
     notify(error instanceof Error ? error.message : '整理失败', 'error')
   } finally {
     fileOrganizing.value = false
+    stopMediaRefreshPolling()
   }
+}
+
+function startMediaRefreshPolling() {
+  if (mediaRefreshTimer !== undefined) return
+  void loadMedia()
+  mediaRefreshTimer = window.setInterval(() => {
+    void loadMedia()
+  }, 2000)
+}
+
+function stopMediaRefreshPolling() {
+  if (mediaRefreshTimer === undefined) return
+  window.clearInterval(mediaRefreshTimer)
+  mediaRefreshTimer = undefined
+}
+
+function changeFileRootType(value: unknown) {
+  if (value !== 'source' && value !== 'mapped') return
+  fileRootType.value = value
+  filePath.value = ''
+  fileParent.value = null
+  fileRoot.value = ''
+  fileEntries.value = []
+  selectedFilePaths.value = []
+  fileSearchQuery.value = ''
+  void loadFiles('')
 }
 
 async function loadMusicLibrary() {
@@ -2401,10 +2487,49 @@ function mediaRemark(row: MediaFile) {
   return row.remark || row.error_message || '-'
 }
 
+function mediaTableRow(item: MediaFile | { raw: MediaFile }) {
+  return 'raw' in item ? item.raw : item
+}
+
 function mediaDisplayPath(row: MediaFile) {
-  if (row.status === 'failed') return row.source_path
-  if (row.status === 'skipped') return '-'
-  return row.library_path || '-'
+  const sourcePath = displayRelativePath(row.source_path, systemForm.value.scraping.source_directory)
+  if (
+    row.status === 'success' &&
+    row.library_path &&
+    pathIsUnderRoot(row.library_path, systemForm.value.scraping.mapped_directory)
+  ) {
+    const mappedPath = displayRelativePath(row.library_path, systemForm.value.scraping.mapped_directory)
+    return `${sourcePath}\n=>\n${mappedPath}`
+  }
+  return sourcePath || '-'
+}
+
+function displayRelativePath(path: string | null | undefined, root: string) {
+  const normalized = normalizeDisplayPath(path)
+  if (!normalized) return ''
+  const normalizedRoot = normalizeDisplayPath(root)
+  if (!normalizedRoot) return normalized
+  const lowerPath = normalized.toLowerCase()
+  const lowerRoot = normalizedRoot.toLowerCase()
+  if (lowerPath === lowerRoot) {
+    const segments = normalized.split('/').filter(Boolean)
+    return segments[segments.length - 1] || normalized
+  }
+  if (lowerPath.startsWith(`${lowerRoot}/`)) return normalized.slice(normalizedRoot.length + 1)
+  return normalized
+}
+
+function pathIsUnderRoot(path: string | null | undefined, root: string) {
+  const normalized = normalizeDisplayPath(path)
+  const normalizedRoot = normalizeDisplayPath(root)
+  if (!normalized || !normalizedRoot) return false
+  const lowerPath = normalized.toLowerCase()
+  const lowerRoot = normalizedRoot.toLowerCase()
+  return lowerPath === lowerRoot || lowerPath.startsWith(`${lowerRoot}/`)
+}
+
+function normalizeDisplayPath(path: string | null | undefined) {
+  return (path || '').replace(/\\/g, '/').replace(/\/+$/g, '').trim()
 }
 
 function logColor(level: string) {
@@ -2433,6 +2558,7 @@ onUnmounted(() => {
   window.clearInterval(logTimer)
   window.clearInterval(downloadTimer)
   window.clearInterval(artistBuildTimer)
+  stopMediaRefreshPolling()
   metadataSearchStream?.close()
 })
 </script>
@@ -2715,66 +2841,91 @@ onUnmounted(() => {
               </v-btn>
             </div>
             <v-card>
-              <v-table>
-                <thead>
-                  <tr>
-                    <th class="select-cell">
-                      <v-checkbox
-                        v-model="allMediaSelected"
-                        :indeterminate="someMediaSelected"
-                        density="compact"
-                        hide-details
-                      />
-                    </th>
-                    <th>标题</th>
-                    <th>艺人</th>
-                    <th>专辑</th>
-                    <th>操作时间</th>
-                    <th>状态</th>
-                    <th>入库路径</th>
-                    <th>备注</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-if="!mediaFiles.length"><td colspan="9" class="empty-cell">暂无整理记录</td></tr>
-                  <tr v-for="row in mediaFiles" :key="row.id">
-                    <td class="select-cell">
-                      <v-checkbox
-                        v-model="selectedMediaIds"
-                        :value="row.id"
-                        density="compact"
-                        hide-details
-                      />
-                    </td>
-                    <td>{{ row.title || '-' }}</td>
-                    <td>{{ row.artist || '-' }}</td>
-                    <td>{{ row.album || '-' }}</td>
-                    <td>{{ formatTime(row.operation_time) }}</td>
-                    <td>
-                      <v-chip
-                        :color="mediaStatusColor(row.status)"
-                        size="small"
-                        variant="tonal"
-                      >
-                        {{ mediaStatusText(row.status) }}
-                      </v-chip>
-                    </td>
-                    <td class="path-cell">{{ mediaDisplayPath(row) }}</td>
-                    <td>{{ mediaRemark(row) }}</td>
-                    <td>
-                      <v-btn
-                        icon="mdi-delete"
-                        color="error"
-                        variant="text"
-                        size="small"
-                        title="删除整理记录"
-                        @click="deleteMediaFile(row)"
-                      />
-                    </td>
-                  </tr>
-                </tbody>
-              </v-table>
+              <v-data-table
+                :headers="mediaTableHeaders"
+                :items="mediaFiles"
+                :items-per-page="-1"
+                class="media-table"
+                density="comfortable"
+                hide-default-footer
+                item-value="id"
+              >
+                <template #header.select>
+                  <v-checkbox
+                    v-model="allMediaSelected"
+                    :indeterminate="someMediaSelected"
+                    density="compact"
+                    hide-details
+                  />
+                </template>
+                <template #item.select="{ item }">
+                  <v-checkbox
+                    v-model="selectedMediaIds"
+                    :value="mediaTableRow(item).id"
+                    density="compact"
+                    hide-details
+                  />
+                </template>
+                <template #item.title="{ item }">
+                  {{ mediaTableRow(item).title || '-' }}
+                </template>
+                <template #item.artist="{ item }">
+                  {{ mediaTableRow(item).artist || '-' }}
+                </template>
+                <template #item.album="{ item }">
+                  {{ mediaTableRow(item).album || '-' }}
+                </template>
+                <template #item.operation_time="{ item }">
+                  {{ formatTime(mediaTableRow(item).operation_time) }}
+                </template>
+                <template #item.status="{ item }">
+                  <v-chip
+                    :color="mediaStatusColor(mediaTableRow(item).status)"
+                    size="small"
+                    variant="tonal"
+                  >
+                    {{ mediaStatusText(mediaTableRow(item).status) }}
+                  </v-chip>
+                </template>
+                <template #item.path="{ item }">
+                  <div class="media-cell-clip media-path-clip">
+                    <v-tooltip location="top" max-width="640">
+                      <template #activator="{ props }">
+                        <span v-bind="props" class="media-path-text">
+                          {{ mediaDisplayPath(mediaTableRow(item)) }}
+                        </span>
+                      </template>
+                      <span class="media-tooltip-text">{{ mediaDisplayPath(mediaTableRow(item)) }}</span>
+                    </v-tooltip>
+                  </div>
+                </template>
+                <template #item.remark="{ item }">
+                  <div class="media-cell-clip media-remark-clip">
+                    <v-tooltip location="top" max-width="420">
+                      <template #activator="{ props }">
+                        <span v-bind="props" class="media-remark-text">
+                          {{ mediaRemark(mediaTableRow(item)) }}
+                        </span>
+                      </template>
+                      <span class="media-tooltip-text">{{ mediaRemark(mediaTableRow(item)) }}</span>
+                    </v-tooltip>
+                  </div>
+                </template>
+                <template #item.actions="{ item }">
+                  <v-btn
+                    icon="mdi-delete"
+                    color="error"
+                    variant="text"
+                    size="small"
+                    title="删除整理记录"
+                    @click="deleteMediaFile(mediaTableRow(item))"
+                  />
+                </template>
+                <template #no-data>
+                  <div class="empty-cell">暂无整理记录</div>
+                </template>
+                <template #bottom></template>
+              </v-data-table>
               <div class="pagination-row">
                 <v-select
                   v-model="mediaPageSize"
@@ -2799,6 +2950,17 @@ onUnmounted(() => {
 
           <section v-if="activePage === 'files'" class="page-stack">
             <div class="toolbar-row">
+              <v-select
+                :model-value="fileRootType"
+                :items="fileRootTypeOptions"
+                item-title="title"
+                item-value="value"
+                label="当前目录"
+                hide-details
+                class="file-root-select"
+                :disabled="fileLoading"
+                @update:model-value="changeFileRootType"
+              />
               <v-btn
                 prepend-icon="mdi-refresh"
                 variant="tonal"
@@ -2814,6 +2976,15 @@ onUnmounted(() => {
                 @click="loadFiles(fileParent || '')"
               >
                 上级目录
+              </v-btn>
+              <v-btn
+                prepend-icon="mdi-playlist-check"
+                color="primary"
+                variant="tonal"
+                :disabled="fileRootType !== 'source' || !selectedFilePaths.length || fileLoading || fileOrganizing"
+                @click="organizeSelectedFiles"
+              >
+                批量整理
               </v-btn>
               <v-btn
                 prepend-icon="mdi-delete"
@@ -2927,7 +3098,8 @@ onUnmounted(() => {
                         color="primary"
                         variant="text"
                         size="small"
-                        title="整理"
+                        :disabled="fileRootType !== 'source' || fileOrganizing"
+                        :title="fileRootType === 'source' ? '整理' : '映射目录不能整理'"
                         @click.stop="openFileOrganize(entry)"
                       />
                       <v-btn
@@ -4225,8 +4397,8 @@ onUnmounted(() => {
     <v-dialog v-model="fileOrganizeDialog" max-width="460">
       <v-card title="确认整理">
         <v-card-text>
-          确定整理“{{ pendingFileOrganize?.name || '-' }}”吗？
-          <span v-if="pendingFileOrganize?.type === 'directory'">目录中的音频文件会批量刮削转移。</span>
+          确定整理{{ pendingFileOrganizeLabel || '选中的项目' }}吗？
+          <span v-if="pendingFileOrganizeHasDirectory">目录中的音频文件会批量刮削转移。</span>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -4542,6 +4714,70 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
+.media-table :deep(table) {
+  min-width: 1660px;
+  table-layout: fixed;
+  width: 1660px;
+}
+
+.media-table :deep(.v-table__wrapper) {
+  overflow-x: auto;
+}
+
+.media-table :deep(th),
+.media-table :deep(td) {
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.media-table :deep(.v-data-table__tr) {
+  height: 56px;
+}
+
+.media-cell-clip {
+  max-width: 100%;
+  overflow: hidden;
+  width: 100%;
+}
+
+.media-path-clip {
+  height: 40px;
+}
+
+.media-remark-clip {
+  height: 20px;
+}
+
+.media-path-text {
+  display: -webkit-box;
+  height: 40px;
+  line-height: 20px;
+  max-height: 40px;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  width: 100%;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: pre-line;
+  word-break: break-all;
+}
+
+.media-remark-text {
+  display: block;
+  height: 20px;
+  line-height: 20px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.media-tooltip-text {
+  white-space: pre-line;
+  word-break: break-all;
+}
+
 .playlist-track-table :deep(table) {
   min-width: 1180px;
 }
@@ -4629,6 +4865,11 @@ onUnmounted(() => {
 .file-search {
   max-width: 360px;
   min-width: 240px;
+}
+
+.file-root-select {
+  max-width: 160px;
+  min-width: 140px;
 }
 
 .file-row-clickable {

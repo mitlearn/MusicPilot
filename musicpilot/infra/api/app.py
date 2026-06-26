@@ -1670,10 +1670,15 @@ def create_app() -> FastAPI:
         return [LogEntryResponse(**entry) for entry in list(state.logs)[:limited]]
 
     @app.get("/api/files", response_model=FileListResponse)
-    async def source_files(path: str = "", query: str = "", limit: int = 500) -> FileListResponse:
+    async def source_files(
+        path: str = "",
+        query: str = "",
+        limit: int = 500,
+        root_type: str = Query(default="source", pattern="^(source|mapped)$"),
+    ) -> FileListResponse:
         settings_payload = await state.repository.get_system_settings()
         config = scraping_config_from_payload(settings_payload)
-        root = _scraping_source_root_or_409(config)
+        root = _scraping_file_root_or_409(config, root_type)
         target = _resolve_source_relative_path(root, path)
         if not target.exists():
             raise HTTPException(status_code=404, detail="文件或目录不存在。")
@@ -1699,7 +1704,7 @@ def create_app() -> FastAPI:
     async def delete_source_files(payload: FileBulkDeleteRequest) -> FileBulkDeleteResponse:
         settings_payload = await state.repository.get_system_settings()
         config = scraping_config_from_payload(settings_payload)
-        root = _scraping_source_root_or_409(config)
+        root = _scraping_file_root_or_409(config, payload.root_type)
         deleted_paths: list[str] = []
         not_found_paths: list[str] = []
         failures: list[FileBulkDeleteFailure] = []
@@ -1731,16 +1736,22 @@ def create_app() -> FastAPI:
         if not config.enabled:
             raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削。")
         root = _scraping_source_root_or_409(config)
-        target = _resolve_source_relative_path(root, payload.path)
-        if not target.exists():
-            raise HTTPException(status_code=404, detail="文件或目录不存在。")
-        source_files = await asyncio.to_thread(_source_audio_files, root, target)
+        raw_paths = payload.paths or [payload.path]
+        targets = [_resolve_source_relative_path(root, item) for item in raw_paths]
+        missing = [raw_paths[index] for index, target in enumerate(targets) if not target.exists()]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"文件或目录不存在：{missing[0] or root}")
+        source_files = await asyncio.to_thread(_source_audio_files_for_targets, root, targets)
         if not source_files:
             raise HTTPException(status_code=422, detail="目标中没有可整理的音频文件。")
+        if len(targets) == 1:
+            task_name = targets[0].name or "manual"
+        else:
+            task_name = "manual batch"
         try:
-            summary = await _scrape_manual_source_files(state, config, target, source_files)
+            summary = await _scrape_manual_source_files(state, config, task_name, source_files)
         except Exception as exc:  # noqa: BLE001
-            state.add_log("metadata", f"Manual scraping failed for {target}: {exc}", "ERROR")
+            state.add_log("metadata", f"Manual scraping failed for {task_name}: {exc}", "ERROR")
             raise HTTPException(status_code=502, detail=f"整理失败：{exc}") from exc
         return FileOrganizeResponse(
             source_files=summary.source_files,
@@ -4166,35 +4177,45 @@ def _file_size_or_none(path: str | None) -> int | None:
 
 
 def _scraping_source_root_or_409(config: ScrapingConfig) -> Path:
-    if config.source_directory is None:
-        raise HTTPException(status_code=409, detail="请先配置刮削源文件目录。")
-    root = config.source_directory.expanduser().resolve()
+    return _scraping_file_root_or_409(config, "source")
+
+
+def _scraping_file_root_or_409(config: ScrapingConfig, root_type: str) -> Path:
+    if root_type == "mapped":
+        configured = config.mapped_directory
+        label = "映射目录"
+    else:
+        configured = config.source_directory
+        label = "源文件目录"
+    if configured is None:
+        raise HTTPException(status_code=409, detail=f"请先配置刮削{label}。")
+    root = configured.expanduser().resolve()
     if not root.exists():
-        raise HTTPException(status_code=404, detail="刮削源文件目录不存在。")
+        raise HTTPException(status_code=404, detail=f"刮削{label}不存在。")
     if not root.is_dir():
-        raise HTTPException(status_code=422, detail="刮削源文件目录不是目录。")
+        raise HTTPException(status_code=422, detail=f"刮削{label}不是目录。")
     return root
 
 
 def _resolve_source_relative_path(root: Path, relative_path: str) -> Path:
     relative = Path(relative_path or "")
     if relative.is_absolute():
-        raise HTTPException(status_code=400, detail="只能访问源文件目录下的相对路径。")
+        raise HTTPException(status_code=400, detail="只能访问当前文件目录下的相对路径。")
     target = (root / relative).resolve()
     if not target.is_relative_to(root):
-        raise HTTPException(status_code=403, detail="不能访问源文件目录之外的路径。")
+        raise HTTPException(status_code=403, detail="不能访问当前文件目录之外的路径。")
     return target
 
 
 def _resolve_source_delete_path(root: Path, relative_path: str) -> Path:
     relative = Path(relative_path or "")
     if relative.is_absolute():
-        raise HTTPException(status_code=400, detail="只能访问源文件目录下的相对路径。")
+        raise HTTPException(status_code=400, detail="只能访问当前文件目录下的相对路径。")
     if not relative.parts:
-        raise HTTPException(status_code=400, detail="不能删除源文件目录。")
+        raise HTTPException(status_code=400, detail="不能删除当前文件目录。")
     parent = (root / relative).parent.resolve()
     if not parent.is_relative_to(root):
-        raise HTTPException(status_code=403, detail="不能访问源文件目录之外的路径。")
+        raise HTTPException(status_code=403, detail="不能访问当前文件目录之外的路径。")
     return parent / relative.name
 
 
@@ -4310,10 +4331,22 @@ def _source_audio_files(root: Path, target: Path) -> tuple[Path, ...]:
     return tuple(sorted(files, key=lambda path: path.as_posix().casefold()))
 
 
+def _source_audio_files_for_targets(root: Path, targets: list[Path]) -> tuple[Path, ...]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for target in targets:
+        for source_file in _source_audio_files(root, target):
+            if source_file in seen:
+                continue
+            seen.add(source_file)
+            files.append(source_file)
+    return tuple(sorted(files, key=lambda path: path.as_posix().casefold()))
+
+
 async def _scrape_manual_source_files(
     state: AppState,
     config: ScrapingConfig,
-    target: Path,
+    task_name: str,
     source_files: tuple[Path, ...],
 ) -> ScrapingSummary:
     try:
@@ -4345,15 +4378,7 @@ async def _scrape_manual_source_files(
         for item in await state.repository.list_media_files()
         if item.title
     )
-    summary = await state.scraper.process_download(
-        task_name=target.name or "manual",
-        save_path=None,
-        config=config,
-        source_files=source_files,
-        library_tracks=library_tracks,
-        media_history=media_history,
-    )
-    for item in summary.results:
+    async def record_file_result(item: ScrapingFileResult) -> None:
         if item.status in {"success", "skipped"}:
             await _ensure_artist_from_metadata(
                 state,
@@ -4370,13 +4395,23 @@ async def _scrape_manual_source_files(
         )
         state.add_log(
             "metadata",
-            _scraping_file_log_message(target.name or "manual", item),
+            _scraping_file_log_message(task_name, item),
             "WARNING" if item.status == "failed" else "INFO",
         )
+
+    summary = await state.scraper.process_download(
+        task_name=task_name,
+        save_path=None,
+        config=config,
+        source_files=source_files,
+        library_tracks=library_tracks,
+        media_history=media_history,
+        on_file_result=record_file_result,
+    )
     state.add_log(
         "metadata",
         "Manual scraping completed for "
-        f"{target}: files={summary.source_files}, mapped={summary.mapped_files}, "
+        f"{task_name}: files={summary.source_files}, mapped={summary.mapped_files}, "
         f"updated={summary.updated_files}, moved={summary.moved_files}, "
         f"failed={summary.failed_files}, "
         f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
