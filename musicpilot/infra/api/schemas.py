@@ -196,6 +196,16 @@ class MediaBulkDeleteResponse(BaseModel):
     failures: list[MediaBulkDeleteFailure] = Field(default_factory=list)
 
 
+class MediaRetryRequest(BaseModel):
+    ids: list[int] = Field(min_length=1)
+
+
+class MediaRetryResponse(BaseModel):
+    total: int
+    source_files: int
+    failed_files: int
+
+
 class IndexerResponse(BaseModel):
     name: str
 

@@ -105,6 +105,8 @@ from musicpilot.infra.api.schemas import (
     MediaDeleteMode,
     MediaFilePageResponse,
     MediaFileResponse,
+    MediaRetryRequest,
+    MediaRetryResponse,
     MediaServerCreateRequest,
     MediaServerResponse,
     MergeArtistsRequest,
@@ -1767,11 +1769,13 @@ def create_app() -> FastAPI:
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=20, ge=1, le=100),
         q: str | None = Query(default=None),
+        status: str | None = Query(default=None),
     ) -> MediaFilePageResponse:
         rows, total = await state.repository.list_media_files_page(
             offset=_page_offset(page, page_size),
             limit=page_size,
             query=_optional_string(q),
+            status=_optional_string(status),
         )
         return MediaFilePageResponse(
             items=[_media_file_response(row) for row in rows],
@@ -1807,6 +1811,32 @@ def create_app() -> FastAPI:
             deleted_ids=deleted_ids,
             not_found_ids=not_found_ids,
             failures=failures,
+        )
+
+    @app.post("/api/media/retry", response_model=MediaRetryResponse)
+    async def retry_media(payload: MediaRetryRequest) -> MediaRetryResponse:
+        media_records: list[MediaFile] = []
+        for mid in payload.ids:
+            rec = await state.repository.get_media_file(mid)
+            if rec and rec.source_path:
+                media_records.append(rec)
+        if not media_records:
+            raise HTTPException(status_code=404, detail="未找到可重试的记录")
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        if not config.enabled:
+            raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削")
+        source_files = tuple(Path(rec.source_path) for rec in media_records)
+        try:
+            summary = await _scrape_manual_source_files(
+                state, config, f"retry {len(source_files)} files", source_files
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"重试失败：{exc}") from exc
+        return MediaRetryResponse(
+            total=len(media_records),
+            source_files=summary.source_files,
+            failed_files=summary.failed_files,
         )
 
     @app.delete("/api/media/{media_id}", status_code=204)

@@ -145,6 +145,12 @@ type MediaBulkDeleteResponse = {
   failures: Array<{ id: number; message: string }>
 }
 
+type MediaRetryResponse = {
+  total: number
+  source_files: number
+  failed_files: number
+}
+
 type FileBulkDeleteResponse = {
   deleted_paths: string[]
   not_found_paths: string[]
@@ -410,6 +416,11 @@ const mediaPage = ref(1)
 const mediaPageSize = ref(20)
 const mediaTotal = ref(0)
 const selectedMediaIds = ref<number[]>([])
+const mediaStatusFilter = ref('')
+const mediaRetrying = ref(false)
+const mediaRetryDialog = ref(false)
+const pendingMediaRetryIds = ref<number[]>([])
+const pendingMediaRetryLabel = ref('')
 const mediaTableHeaders = [
   { title: '', key: 'select', sortable: false, width: 48 },
   { title: '标题', key: 'title', sortable: false, width: 160 },
@@ -1183,6 +1194,7 @@ async function loadMedia() {
   })
   const query = trimmedInput(mediaQuery.value)
   if (query) params.set('q', query)
+  if (mediaStatusFilter.value) params.set('status', mediaStatusFilter.value)
   const response = await api<PageResponse<MediaFile>>(`/api/media?${params.toString()}`)
   mediaFiles.value = response.items
   mediaTotal.value = response.total
@@ -1256,6 +1268,41 @@ async function confirmDeleteMedia(mode: MediaDeleteMode) {
   } finally {
     mediaDeleting.value = false
     activeMediaDeleteMode.value = null
+  }
+}
+
+function retrySingleMedia(row: MediaFile) {
+  pendingMediaRetryIds.value = [row.id]
+  pendingMediaRetryLabel.value = `整理记录"${row.title || row.source_path || '-'}"`
+  mediaRetryDialog.value = true
+}
+
+function retrySelectedMedia() {
+  const ids = [...selectedMediaIds.value]
+  if (!ids.length) return
+  pendingMediaRetryIds.value = ids
+  pendingMediaRetryLabel.value = `选中的 ${ids.length} 条整理记录`
+  mediaRetryDialog.value = true
+}
+
+async function confirmRetryMedia() {
+  const ids = [...pendingMediaRetryIds.value]
+  if (!ids.length) return
+  mediaRetrying.value = true
+  try {
+    const result = await api<MediaRetryResponse>('/api/media/retry', {
+      method: 'POST',
+      body: JSON.stringify({ ids })
+    })
+    pendingMediaRetryIds.value = []
+    mediaRetryDialog.value = false
+    await loadMedia()
+    notify(`重试完成：${result.source_files} 个文件已处理，${result.failed_files} 个失败`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '重试失败', 'error')
+    await loadMedia()
+  } finally {
+    mediaRetrying.value = false
   }
 }
 
@@ -2483,6 +2530,13 @@ function mediaStatusText(status: string) {
   return '成功'
 }
 
+const mediaStatusFilterOptions = [
+  { title: '全部', value: '' },
+  { title: '成功', value: 'success' },
+  { title: '失败', value: 'failed' },
+  { title: '跳过', value: 'skipped' },
+]
+
 function mediaRemark(row: MediaFile) {
   return row.remark || row.error_message || '-'
 }
@@ -2818,6 +2872,15 @@ onUnmounted(() => {
             <div class="toolbar-row">
               <v-btn prepend-icon="mdi-refresh" variant="tonal" @click="loadMedia">刷新</v-btn>
               <v-btn
+                prepend-icon="mdi-refresh"
+                variant="tonal"
+                :disabled="!selectedMediaIds.length || mediaRetrying"
+                :loading="mediaRetrying"
+                @click="retrySelectedMedia"
+              >
+                重试
+              </v-btn>
+              <v-btn
                 prepend-icon="mdi-delete"
                 color="error"
                 variant="tonal"
@@ -2839,6 +2902,18 @@ onUnmounted(() => {
               <v-btn prepend-icon="mdi-magnify" variant="tonal" @click="applyMediaFilters">
                 搜索
               </v-btn>
+              <v-select
+                v-model="mediaStatusFilter"
+                :items="mediaStatusFilterOptions"
+                item-title="title"
+                item-value="value"
+                label="状态筛选"
+                hide-details
+                density="compact"
+                class="status-filter-select"
+                clearable
+                @update:model-value="applyMediaFilters"
+              />
             </div>
             <v-card>
               <v-data-table
@@ -2912,6 +2987,15 @@ onUnmounted(() => {
                   </div>
                 </template>
                 <template #item.actions="{ item }">
+                  <v-btn
+                    icon="mdi-refresh"
+                    color="primary"
+                    variant="text"
+                    size="small"
+                    title="重试"
+                    :disabled="mediaRetrying"
+                    @click="retrySingleMedia(mediaTableRow(item))"
+                  />
                   <v-btn
                     icon="mdi-delete"
                     color="error"
@@ -4394,6 +4478,21 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="mediaRetryDialog" max-width="400">
+      <v-card title="确认重试">
+        <v-card-text>确认重试 {{ pendingMediaRetryLabel }} ？</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="mediaRetrying" @click="mediaRetryDialog = false">
+            取消
+          </v-btn>
+          <v-btn color="primary" variant="tonal" :loading="mediaRetrying" @click="confirmRetryMedia">
+            确认重试
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="fileOrganizeDialog" max-width="460">
       <v-card title="确认整理">
         <v-card-text>
@@ -4561,6 +4660,11 @@ onUnmounted(() => {
 .table-search {
   max-width: 360px;
   min-width: 240px;
+}
+
+.status-filter-select {
+  max-width: 140px;
+  min-width: 110px;
 }
 
 .page-size-select {

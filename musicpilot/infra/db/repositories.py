@@ -782,6 +782,7 @@ class SqlAlchemyMediaRepository:
         offset: int,
         limit: int,
         query: str | None = None,
+        status: str | None = None,
     ) -> tuple[list[MediaFile], int]:
         conditions = []
         if query:
@@ -797,6 +798,8 @@ class SqlAlchemyMediaRepository:
                     MediaFile.error_message.ilike(pattern),
                 )
             )
+        if status:
+            conditions.append(MediaFile.status == status)
         async with self.database.session() as session:
             total_result = await session.execute(
                 select(func.count()).select_from(MediaFile).where(*conditions)
