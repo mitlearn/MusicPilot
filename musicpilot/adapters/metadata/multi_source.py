@@ -69,7 +69,7 @@ class MultiSourceMusicProvider:
         limit: int = 5,
     ) -> AsyncIterator[tuple[TrackMetadata, ...]]:
         for resource in ("qmusic", "netease", "migu", "kuwo"):
-            songs = await self._fetch_id3_by_title(resource, title)
+            songs = await self._fetch_id3_by_title(resource, title, artist=artist)
             matched = _matched_songs(title, artist or "", songs, limit)
             if not matched:
                 continue
@@ -83,16 +83,17 @@ class MultiSourceMusicProvider:
         self,
         resource: str,
         title: str,
+        artist: str | None = None,
     ) -> tuple[_SourceSong, ...]:
         try:
             if resource == "qmusic":
-                return await self._fetch_qmusic_id3_by_title(title)
+                return await self._fetch_qmusic_id3_by_title(title, artist=artist)
             if resource == "netease":
-                return await self._fetch_netease_id3_by_title(title)
+                return await self._fetch_netease_id3_by_title(title, artist=artist)
             if resource == "migu":
-                return await self._fetch_migu_id3_by_title(title)
+                return await self._fetch_migu_id3_by_title(title, artist=artist)
             if resource == "kuwo":
-                return await self._fetch_kuwo_id3_by_title(title)
+                return await self._fetch_kuwo_id3_by_title(title, artist=artist)
         except Exception:
             return ()
         return ()
@@ -111,7 +112,8 @@ class MultiSourceMusicProvider:
             return None
         return None
 
-    async def _fetch_qmusic_id3_by_title(self, title: str) -> tuple[_SourceSong, ...]:
+    async def _fetch_qmusic_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+        query = _search_query(title, artist)
         payload = {
             "comm": {
                 "wid": "",
@@ -141,7 +143,7 @@ class MultiSourceMusicProvider:
                     "page_num": 1,
                     "remoteplace": "txt.mac.search",
                     "search_type": 0,
-                    "query": title,
+                    "query": query,
                     "grp": 1,
                     "searchid": str(uuid1()),
                     "nqc_flag": 0,
@@ -207,10 +209,11 @@ class MultiSourceMusicProvider:
             return None
         return base64.b64decode(lyric).decode("utf-8", errors="ignore").strip() or None
 
-    async def _fetch_netease_id3_by_title(self, title: str) -> tuple[_SourceSong, ...]:
+    async def _fetch_netease_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+        query = _search_query(title, artist)
         response = await self._client.get(
             "https://music.163.com/api/search/get/web",
-            params={"s": title, "type": 1, "limit": 10, "offset": 0},
+            params={"s": query, "type": 1, "limit": 10, "offset": 0},
             headers={
                 "Referer": "https://music.163.com/",
                 "User-Agent": (
@@ -248,10 +251,11 @@ class MultiSourceMusicProvider:
         lyric = response.json().get("lrc", {}).get("lyric")
         return lyric.strip() if isinstance(lyric, str) and lyric.strip() else None
 
-    async def _fetch_migu_id3_by_title(self, title: str) -> tuple[_SourceSong, ...]:
+    async def _fetch_migu_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+        query = _search_query(title, artist)
         response = await self._client.get(
             "https://m.music.migu.cn/migu/remoting/scr_search_tag",
-            params={"rows": 10, "type": 2, "keyword": title, "pgc": 1},
+            params={"rows": 10, "type": 2, "keyword": query, "pgc": 1},
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) "
@@ -285,10 +289,11 @@ class MultiSourceMusicProvider:
         lyric = response.json().get("lyric")
         return lyric.strip() if isinstance(lyric, str) and lyric.strip() else None
 
-    async def _fetch_kuwo_id3_by_title(self, title: str) -> tuple[_SourceSong, ...]:
+    async def _fetch_kuwo_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+        query = _search_query(title, artist)
         response = await self._client.get(
             "http://www.kuwo.cn/api/www/search/searchMusicBykeyWord",
-            params={"key": title, "pn": 1, "rn": 10, "httpsStatus": 1},
+            params={"key": query, "pn": 1, "rn": 10, "httpsStatus": 1},
             headers=_kuwo_headers(self._kuwo_token, self._kuwo_cross),
         )
         response.raise_for_status()
@@ -328,6 +333,13 @@ class MultiSourceMusicProvider:
             hour, minutes = divmod(minutes, 60)
             lyric += f"[{hour}:{minutes:02d}:{second:02d}]{line.get('lineLyric') or ''}\n"
         return lyric.strip() or None
+
+
+def _search_query(title: str, artist: str | None = None) -> str:
+    """Build search query: title alone, or title + artist when provided."""
+    if artist:
+        return f"{title} {artist}"
+    return title
 
 
 def _matched_songs(
