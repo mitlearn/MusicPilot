@@ -1491,7 +1491,27 @@ def _match_score(left: str | None, right: str | None) -> int:
         return 2
     if left_normalized in right_normalized or right_normalized in left_normalized:
         return 1
+    # Fuzzy word overlap: if most significant words match, give partial score
+    if _fuzzy_word_overlap(left, right) >= 0.6:
+        return 1
     return 0
+
+
+def _fuzzy_word_overlap(left: str | None, right: str | None) -> float:
+    """Compute the fraction of tokens from the shorter text present in the longer one.
+
+    Splits each string on non-alphanumeric boundaries, extracts lowercased
+    tokens of at least 2 characters, then measures overlap ratio.
+    """
+    if not left or not right:
+        return 0.0
+    left_tokens = {m.group(0).casefold() for m in re.finditer(r"[a-z0-9]{2,}", left)}
+    right_tokens = {m.group(0).casefold() for m in re.finditer(r"[a-z0-9]{2,}", right)}
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shorter = left_tokens if len(left_tokens) <= len(right_tokens) else right_tokens
+    longer = right_tokens if len(left_tokens) <= len(right_tokens) else left_tokens
+    return len(shorter & longer) / len(shorter)
 
 
 def _match_artist(left: str | None, right: str | None) -> int:
