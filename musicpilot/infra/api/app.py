@@ -12,13 +12,13 @@ import shutil
 import time
 import unicodedata
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
 from secrets import compare_digest, token_urlsafe
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
@@ -164,7 +164,7 @@ from musicpilot.infra.db.models import (
     TorrentRecordItem,
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
-from musicpilot.ports.downloader import DownloadStatus, TorrentFile
+from musicpilot.ports.downloader import DownloadStatus
 from musicpilot.ports.metadata import MediaCandidate, TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
@@ -184,12 +184,32 @@ _TORRENT_AUDIO_EXTENSIONS = {
 DOWNLOAD_POLL_INTERVAL_SECONDS = 5
 MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
+PLAYLIST_TRACK_RETRYABLE_STATUSES = {
+    "failed",
+    "not_found",
+    "deleted",
+    "source_directory_not_found",
+}
+PLAYLIST_TRACK_ACTIVE_STATUSES = {
+    "waiting",
+    "queue",
+    "searching",
+    "submitted",
+    "downloading",
+    "completed",
+    "refreshing_library",
+}
+PLAYLIST_TRACK_SUCCESS_STATUSES = {"existing", "library_refreshed"}
 
 
 @dataclasses.dataclass(frozen=True)
 class SubmittedTorrent:
     torrent_hash: str
     torrent_data: bytes | None = None
+
+
+class ScrapingSourceDirectoryNotFound(RuntimeError):
+    pass
 
 
 class MetadataSiteSearchTask:
@@ -1057,9 +1077,10 @@ def create_app() -> FastAPI:
 
     @app.post("/api/settings/downloaders", response_model=DownloaderResponse, status_code=201)
     async def create_downloader(payload: DownloaderCreateRequest) -> DownloaderResponse:
+        _validate_downloader_paths(payload)
         if not payload.password:
             raise HTTPException(status_code=422, detail="Password is required.")
-        downloader = await state.repository.upsert_downloader(payload=payload.model_dump())
+        downloader = await state.repository.upsert_downloader(payload=_downloader_payload(payload))
         await state.reload_downloader()
         return _downloader_response(downloader)
 
@@ -1070,9 +1091,10 @@ def create_app() -> FastAPI:
     ) -> DownloaderResponse:
         if await state.repository.get_downloader(downloader_id) is None:
             raise HTTPException(status_code=404, detail="Downloader not found.")
+        _validate_downloader_paths(payload)
         downloader = await state.repository.upsert_downloader(
             downloader_id=downloader_id,
-            payload=payload.model_dump(),
+            payload=_downloader_payload(payload),
         )
         await state.reload_downloader()
         return _downloader_response(downloader)
@@ -1086,6 +1108,9 @@ def create_app() -> FastAPI:
 
     @app.post("/api/settings/downloaders/test", response_model=TestResponse)
     async def test_downloader(payload: DownloaderCreateRequest) -> TestResponse:
+        path_error = _downloader_path_error(payload)
+        if path_error is not None:
+            return TestResponse(ok=False, message=path_error)
         password = payload.password
         if not password and payload.id:
             existing = await state.repository.get_downloader(payload.id)
@@ -1096,7 +1121,7 @@ def create_app() -> FastAPI:
             payload.base_url,
             username=payload.username,
             password=password,
-            download_path=payload.download_path,
+            download_path=payload.download_path.strip(),
         )
         try:
             await client.test_connection()
@@ -1650,6 +1675,11 @@ def create_app() -> FastAPI:
                 status="running",
                 playlist_id=playlist_id,
                 track_id=track_id,
+            )
+        if not _playlist_track_can_start_download(track):
+            raise HTTPException(
+                status_code=409,
+                detail="该单曲当前状态不允许下载或重试。",
             )
         state.add_log(
             "playlist",
@@ -2526,6 +2556,15 @@ def _download_task_item_titles(item: TorrentRecordItem) -> list[str]:
     return [value for value in values if value]
 
 
+def _playlist_track_can_start_download(track: PlaylistTrack) -> bool:
+    if track.exists_in_library:
+        return False
+    status = track.download_status
+    if status in PLAYLIST_TRACK_ACTIVE_STATUSES | PLAYLIST_TRACK_SUCCESS_STATUSES:
+        return False
+    return status == "pending" or status in PLAYLIST_TRACK_RETRYABLE_STATUSES
+
+
 def _normalized_artist_credit_parts(value: str | None) -> set[str]:
     parts: set[str] = set()
     for artist in split_artist_credit(value):
@@ -2589,13 +2628,7 @@ async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
                     "playlist",
                     f"Playlist track skipped, already in library: {_playlist_track_log_text(track)}",
                 )
-            elif track.download_status not in (
-                "submitted",
-                "downloading",
-                "completed",
-                "refreshing_library",
-                "library_refreshed",
-            ):
+            elif _playlist_track_can_start_download(track):
                 await state.repository.update_playlist_track(
                     track.id, download_status="waiting", last_error=None,
                 )
@@ -2656,7 +2689,9 @@ async def _enqueue_playlist_track_download(
         await state.repository.update_playlist_track(
             track.id,
             download_status="queue",
+            torrent_record_id=None,
             last_checked_at=datetime.now(UTC),
+            last_download_attempt_at=None,
             last_error=None,
         )
     artist_keys = await _playlist_track_artist_queue_keys(state, track)
@@ -3118,6 +3153,7 @@ def _playlist_download_status_for_task(task: TorrentRecord) -> str:
         "completed",
         "refreshing_library",
         "library_refreshed",
+        "source_directory_not_found",
         "failed",
         "deleted",
     }:
@@ -3133,7 +3169,11 @@ async def _sync_playlist_tracks_for_download_task(
     if not tracks:
         return
     status = _playlist_download_status_for_task(task)
-    last_error = task.last_error if status in {"failed", "deleted"} else None
+    last_error = (
+        task.last_error
+        if status in {"failed", "deleted", "source_directory_not_found"}
+        else None
+    )
     for track in tracks:
         if track.exists_in_library or track.download_status == "existing":
             continue
@@ -3788,6 +3828,27 @@ def _downloader_response(item: DownloaderConfig) -> DownloaderResponse:
         is_default=item.is_default,
         enabled=item.enabled,
     )
+
+
+def _validate_downloader_paths(payload: DownloaderCreateRequest) -> None:
+    error = _downloader_path_error(payload)
+    if error is not None:
+        raise HTTPException(status_code=422, detail=error)
+
+
+def _downloader_path_error(payload: DownloaderCreateRequest) -> str | None:
+    if not payload.download_path.strip():
+        return "下载器下载目录不能为空。"
+    if not payload.local_path.strip():
+        return "下载器本机对应目录不能为空。"
+    return None
+
+
+def _downloader_payload(payload: DownloaderCreateRequest) -> dict[str, object]:
+    data = payload.model_dump()
+    data["download_path"] = payload.download_path.strip()
+    data["local_path"] = payload.local_path.strip()
+    return data
 
 
 def _media_server_response(item: MediaServerConfig) -> MediaServerResponse:
@@ -4562,7 +4623,22 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
         refreshing = await state.repository.update_download_task(task.id, status="refreshing_library")
         if refreshing is not None:
             await _sync_playlist_tracks_for_download_task(state, refreshing)
-    summary = await _scrape_download_for_task(state, task)
+    try:
+        summary = await _scrape_download_for_task(state, task)
+    except ScrapingSourceDirectoryNotFound as exc:
+        failed = await state.repository.update_download_task(
+            task.id,
+            status="source_directory_not_found",
+            last_error=str(exc),
+        )
+        if failed is not None:
+            await _sync_playlist_tracks_for_download_task(state, failed)
+        state.add_log(
+            "metadata",
+            f"Scraping source directory not found for {task.name}: {exc}",
+            "WARNING",
+        )
+        return
     if summary is not None and not summary.mapped_files and not summary.updated_files and not summary.moved_files:
         state.add_log(
             "library",
@@ -4673,6 +4749,8 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Scr
             media_history=media_history,
             cached_metadata=cached_metadata,
         )
+    except ScrapingSourceDirectoryNotFound:
+        raise
     except Exception as exc:  # noqa: BLE001
         state.add_log("metadata", f"Scraping failed for {task.name}: {exc}", "WARNING")
         return
@@ -4739,15 +4817,6 @@ async def _scraping_source_files_for_task(
             "WARNING",
         )
         return None
-    try:
-        torrent_files = await state.downloader.list_files(task.torrent_hash or "")
-    except Exception as exc:  # noqa: BLE001
-        torrent_files = ()
-        state.add_log(
-            "metadata",
-            f"qBittorrent file list unavailable for {task.name}, mapped directory scan will still run: {exc}",
-            "WARNING",
-        )
     downloader_config = await state.repository.default_downloader()
     source_files = await asyncio.to_thread(
         _mapped_torrent_audio_files,
@@ -4761,12 +4830,14 @@ async def _scraping_source_files_for_task(
             f"Scraping source files resolved from mapped download path for {task.name}: files={len(source_files)}",
         )
         return source_files
-    source_files = _resolve_torrent_audio_files(task, status, torrent_files)
     state.add_log(
         "metadata",
-        f"Scraping source files resolved for {task.name}: files={len(source_files)}",
+        f"Scraping source files not found from mapped download path for {task.name}.",
+        "WARNING",
     )
-    return source_files
+    raise ScrapingSourceDirectoryNotFound(
+        _scraping_source_directory_not_found_message(task, status, downloader_config)
+    )
 
 
 async def _cached_metadata_for_task_source_files(
@@ -4810,6 +4881,36 @@ async def _cached_metadata_for_task_source_files(
             used_item_ids.add(item.id)
             result[source_file] = (metadata,)
     return result
+
+
+def _scraping_source_directory_not_found_message(
+    task: TorrentRecord,
+    status: DownloadStatus,
+    downloader: DownloaderConfig | None,
+) -> str:
+    remote_roots = _download_remote_roots(task, status, downloader)
+    content_roots = _torrent_content_roots(task, status)
+    local_root = (downloader.local_path if downloader is not None else "").strip()
+    remote_paths = content_roots or tuple(Path(item) for item in remote_roots)
+    remote_text = _join_log_values(str(item) for item in remote_paths)
+    if local_root:
+        return (
+            "下载已完成，但映射后的本机目录中没有找到可刮削的音频文件。"
+            f"请检查下载器下载目录和本机映射目录。qBittorrent路径={remote_text or '-'}，"
+            f"本机映射目录={local_root}"
+        )
+    return (
+        "下载已完成，但 MusicPilot 无法访问 qBittorrent 返回的下载目录，"
+        "且下载器未配置本机映射目录。"
+        f"请在下载器设置中配置映射目录。qBittorrent路径={remote_text or '-'}"
+    )
+
+
+def _join_log_values(values: Iterable[object]) -> str:
+    items = [str(item) for item in values if str(item).strip()]
+    if len(items) <= 3:
+        return ", ".join(items)
+    return ", ".join(items[:3]) + f", ...(+{len(items) - 3})"
 
 
 def _track_metadata_from_payload(payload: dict[str, Any] | None) -> TrackMetadata | None:
@@ -4874,8 +4975,6 @@ def _mapped_torrent_targets(
     candidates = _torrent_content_roots(task, status)
     mapped: list[Path] = []
     for candidate in candidates:
-        if candidate.exists():
-            mapped.append(candidate)
         for remote_root in remote_roots:
             local = _map_downloader_path(candidate, remote_root, local_root)
             if local is not None:
@@ -4944,56 +5043,6 @@ def _map_downloader_path(
 
 def _normalized_path_text(value: str) -> str:
     return value.replace("\\", "/").rstrip("/")
-
-
-def _resolve_torrent_audio_files(
-    task: TorrentRecord,
-    status: DownloadStatus,
-    torrent_files: tuple[TorrentFile, ...],
-) -> tuple[Path, ...]:
-    seen: set[Path] = set()
-    source_files: list[Path] = []
-    for torrent_file in torrent_files:
-        if torrent_file.progress < 1:
-            continue
-        for candidate in _torrent_file_candidates(task, status, torrent_file.path):
-            if not candidate.is_file() or not _is_audio_file(candidate):
-                continue
-            resolved = candidate.resolve()
-            if resolved in seen:
-                break
-            seen.add(resolved)
-            source_files.append(resolved)
-            break
-    return tuple(source_files)
-
-
-def _torrent_file_candidates(
-    task: TorrentRecord,
-    status: DownloadStatus,
-    relative_path: Path,
-) -> tuple[Path, ...]:
-    if relative_path.is_absolute():
-        return (relative_path,)
-    candidates: list[Path] = []
-    content_path = status.content_path
-    if content_path is not None:
-        if content_path.is_file():
-            candidates.append(content_path)
-        else:
-            candidates.append(content_path / relative_path)
-            candidates.append(content_path.parent / relative_path)
-    roots = [
-        Path(task.save_path) if task.save_path else None,
-        status.save_path,
-    ]
-    for root in roots:
-        if root is None:
-            continue
-        if task.name:
-            candidates.append(root / task.name / relative_path)
-        candidates.append(root / relative_path)
-    return tuple(_dedupe_paths(candidates))
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:

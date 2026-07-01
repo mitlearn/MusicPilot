@@ -763,7 +763,12 @@ class SqlAlchemyMediaRepository:
                 "library_refreshed",
             }:
                 counts["submitted_count"] += 1
-            if track.download_status in {"failed", "not_found", "deleted"}:
+            if track.download_status in {
+                "failed",
+                "not_found",
+                "deleted",
+                "source_directory_not_found",
+            }:
                 counts["failed_count"] += 1
         return counts
 

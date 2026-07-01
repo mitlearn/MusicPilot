@@ -647,6 +647,7 @@ const playlistTrackDownloadStatusOptions = [
   { title: '已入库', value: 'library_refreshed' },
   { title: '已存在', value: 'existing' },
   { title: '未找到', value: 'not_found' },
+  { title: '目录未找到', value: 'source_directory_not_found' },
   { title: '失败', value: 'failed' },
   { title: '已删除', value: 'deleted' }
 ]
@@ -1905,9 +1906,33 @@ function isPlaylistTrackDownloading(trackId: number) {
   return playlistTrackDownloadingIds.value.includes(trackId)
 }
 
+const playlistTrackRetryableStatuses = new Set([
+  'failed',
+  'not_found',
+  'deleted',
+  'source_directory_not_found'
+])
+
+function canStartPlaylistTrackDownload(track: PlaylistTrack) {
+  if (track.exists_in_library || isPlaylistTrackDownloading(track.id)) return false
+  return track.download_status === 'pending' || playlistTrackRetryableStatuses.has(track.download_status)
+}
+
+function isPlaylistTrackRetry(track: PlaylistTrack) {
+  return playlistTrackRetryableStatuses.has(track.download_status)
+}
+
+function playlistTrackActionIcon(track: PlaylistTrack) {
+  return isPlaylistTrackRetry(track) ? 'mdi-refresh' : 'mdi-download'
+}
+
+function playlistTrackActionTitle(track: PlaylistTrack) {
+  return isPlaylistTrackRetry(track) ? '重试' : '下载'
+}
+
 async function downloadPlaylistTrack(track: PlaylistTrack) {
   const playlist = selectedPlaylist.value
-  if (!playlist || isPlaylistTrackDownloading(track.id)) return
+  if (!playlist || !canStartPlaylistTrackDownload(track)) return
   playlistTrackDownloadingIds.value = [...playlistTrackDownloadingIds.value, track.id]
   try {
     await api(`/api/playlists/${playlist.id}/tracks/${track.id}/download`, {
@@ -2094,6 +2119,11 @@ function editDownloader(downloader: DownloaderConfig) {
 }
 
 async function testDownloader() {
+  const pathError = downloaderPathError()
+  if (pathError) {
+    notify(pathError, 'error')
+    return
+  }
   downloaderTesting.value = true
   try {
     const result = await api<TestResponse>('/api/settings/downloaders/test', {
@@ -2109,6 +2139,11 @@ async function testDownloader() {
 }
 
 async function saveDownloader() {
+  const pathError = downloaderPathError()
+  if (pathError) {
+    notify(pathError, 'error')
+    return
+  }
   const editing = Boolean(editingDownloaderId.value)
   const downloader = await api<DownloaderConfig>(
     editing
@@ -2128,6 +2163,12 @@ async function saveDownloader() {
   }
   downloaderDialog.value = false
   notify('下载器已保存')
+}
+
+function downloaderPathError() {
+  if (!trimmedInput(downloaderForm.value.download_path)) return '下载目录不能为空'
+  if (!trimmedInput(downloaderForm.value.local_path)) return '本机对应目录不能为空'
+  return ''
 }
 
 function openDeleteDownloader(downloader: DownloaderConfig) {
@@ -2480,6 +2521,7 @@ function playlistTrackStatusText(status: string) {
     refreshing_library: '刷新曲库',
     library_refreshed: '曲库已刷新',
     not_found: '未找到',
+    source_directory_not_found: '目录未找到',
     failed: '失败',
     deleted: '已删除'
   }[status] ?? status
@@ -2497,6 +2539,7 @@ function playlistTrackStatusColor(status: string) {
     refreshing_library: 'info',
     library_refreshed: 'success',
     not_found: 'error',
+    source_directory_not_found: 'error',
     failed: 'error',
     deleted: 'error'
   }[status] ?? 'secondary'
@@ -4200,13 +4243,13 @@ onUnmounted(() => {
                 </td>
                 <td class="sticky-track-col sticky-track-download-col">
                   <v-btn
-                    icon="mdi-download"
+                    :icon="playlistTrackActionIcon(track)"
                     color="primary"
                     variant="text"
                     size="small"
-                    title="下载"
+                    :title="playlistTrackActionTitle(track)"
                     :loading="isPlaylistTrackDownloading(track.id)"
-                    :disabled="track.exists_in_library"
+                    :disabled="!canStartPlaylistTrackDownload(track)"
                     @click="downloadPlaylistTrack(track)"
                   />
                 </td>
@@ -4271,8 +4314,18 @@ onUnmounted(() => {
             type="password"
             :placeholder="editingDownloaderId ? '留空则保持原密码' : ''"
           />
-          <v-text-field v-model="downloaderForm.download_path" label="下载目录" placeholder="/downloads/music" />
-          <v-text-field v-model="downloaderForm.local_path" label="本机对应目录" placeholder="/volume1/music" />
+          <v-text-field
+            v-model="downloaderForm.download_path"
+            label="下载目录"
+            placeholder="/downloads/music"
+            required
+          />
+          <v-text-field
+            v-model="downloaderForm.local_path"
+            label="本机对应目录"
+            placeholder="/volume1/music"
+            required
+          />
           <v-select
             v-model="downloaderForm.listen_mode"
             :items="[
