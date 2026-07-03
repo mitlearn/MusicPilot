@@ -443,6 +443,13 @@ class PlaylistTrackDownloadResponse(BaseModel):
     track_id: int
 
 
+class PlaylistLibrarySyncResponse(BaseModel):
+    status: str
+    playlist_id: int
+    library_playlist_id: str | None = None
+    synced_count: int
+
+
 class ProxySettings(BaseModel):
     host: str = ""
     port: int = Field(default=0, ge=0, le=65535)

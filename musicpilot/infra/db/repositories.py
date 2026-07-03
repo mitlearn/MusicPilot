@@ -880,6 +880,26 @@ class SqlAlchemyMediaRepository:
             )
             return list(result.scalars().all())
 
+    async def list_matched_playlist_library_tracks(
+        self,
+        playlist_id: int,
+    ) -> list[tuple[PlaylistTrack, MusicLibraryTrack]]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack, MusicLibraryTrack)
+                .join(
+                    MusicLibraryTrack,
+                    PlaylistTrack.matched_library_track_id == MusicLibraryTrack.id,
+                )
+                .where(
+                    PlaylistTrack.playlist_id == playlist_id,
+                    PlaylistTrack.exists_in_library.is_(True),
+                    PlaylistTrack.matched_library_track_id.isnot(None),
+                )
+                .order_by(PlaylistTrack.position, PlaylistTrack.id)
+            )
+            return [(track, library_track) for track, library_track in result.all()]
+
     async def playlist_track_counts(self, playlist_id: int) -> dict[str, int]:
         tracks = await self.list_playlist_tracks(playlist_id)
         counts: dict[str, int] = {
@@ -1063,8 +1083,11 @@ class SqlAlchemyMediaRepository:
                 row.year = _optional_int(payload.get("year"))
                 row.suffix = _optional_string(payload.get("suffix"))
                 row.path = _optional_string(payload.get("path"))
-                row.content_type = _optional_string(payload.get("contentType"))
-                row.raw_payload = payload
+                row.content_type = _optional_string(
+                    payload.get("contentType") or payload.get("content_type")
+                )
+                raw_payload = payload.get("raw_payload")
+                row.raw_payload = raw_payload if isinstance(raw_payload, dict) else payload
                 row.last_synced_at = synced_at
             for navidrome_id, row in existing.items():
                 if navidrome_id not in seen_ids:

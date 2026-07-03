@@ -1,9 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import contextlib
 import dataclasses
-import hashlib
 import json
 import logging
 import os
@@ -20,7 +19,6 @@ from pathlib import Path
 from secrets import compare_digest, token_urlsafe
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
-from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
@@ -37,6 +35,7 @@ from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPParserConfig,
     NexusPHPSiteConfig,
 )
+from musicpilot.adapters.media_servers import build_media_server_client
 from musicpilot.adapters.metadata import (
     MultiSourceMusicProvider,
     MusicBrainzProvider,
@@ -131,6 +130,7 @@ from musicpilot.infra.api.schemas import (
     PlaylistImportUrlPreviewRequest,
     PlaylistImportUrlPreviewResponse,
     PlaylistImportUrlRequest,
+    PlaylistLibrarySyncResponse,
     PlaylistResponse,
     PlaylistTrackDownloadResponse,
     PlaylistTrackPageResponse,
@@ -1194,15 +1194,11 @@ def create_app() -> FastAPI:
     @app.post("/api/settings/media-servers/test", response_model=TestResponse)
     async def test_media_server(payload: MediaServerCreateRequest) -> TestResponse:
         try:
-            async with httpx.AsyncClient(
-                base_url=payload.base_url.rstrip("/"),
-                timeout=20,
-            ) as client:
-                response = await client.get("/rest/ping.view", params=_navidrome_params(payload))
-                response.raise_for_status()
+            client = build_media_server_client(payload)
+            await client.ping()
         except Exception as exc:  # noqa: BLE001
-            return TestResponse(ok=False, message=f"Navidrome 连接失败：{exc}")
-        return TestResponse(ok=True, message="Navidrome 连接成功")
+            return TestResponse(ok=False, message=f"媒体服务器连接失败：{exc}")
+        return TestResponse(ok=True, message="媒体服务器连接成功")
 
     @app.get("/api/settings/notifiers", response_model=list[NotifierResponse])
     async def notifiers() -> list[NotifierResponse]:
@@ -1657,6 +1653,30 @@ def create_app() -> FastAPI:
         synced = await _import_spotify_playlist(state, connection, access_token, source)
         return await _playlist_response(state, synced)
 
+    @app.post(
+        "/api/playlists/{playlist_id}/sync-to-library",
+        response_model=PlaylistLibrarySyncResponse,
+    )
+    async def sync_playlist_to_library(playlist_id: int) -> PlaylistLibrarySyncResponse:
+        playlist = await state.repository.get_playlist(playlist_id)
+        if playlist is None:
+            raise HTTPException(status_code=404, detail="Playlist not found.")
+        try:
+            library_playlist_id, synced_count = await _sync_playlist_to_media_server(
+                state,
+                playlist,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"媒体服务器歌单同步失败：{exc}") from exc
+        return PlaylistLibrarySyncResponse(
+            status="synced",
+            playlist_id=playlist.id,
+            library_playlist_id=library_playlist_id,
+            synced_count=synced_count,
+        )
+
     @app.post("/api/playlists/{playlist_id}/download", response_model=PlaylistDownloadResponse)
     async def download_playlist(playlist_id: int) -> PlaylistDownloadResponse:
         playlist = await state.repository.get_playlist(playlist_id)
@@ -1946,9 +1966,9 @@ def create_app() -> FastAPI:
         q: str | None = Query(default=None),
     ) -> MusicLibraryTrackPageResponse:
         try:
-            await _sync_music_library_from_navidrome(state)
+            await _sync_music_library_from_media_server(state)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"Navidrome 音乐库同步失败：{exc}") from exc
+            raise HTTPException(status_code=502, detail=f"媒体服务器音乐库同步失败：{exc}") from exc
         rows, total, albums, artists = await state.repository.list_music_library_tracks_page(
             offset=_page_offset(page, page_size),
             limit=page_size,
@@ -4180,20 +4200,6 @@ def _normalized_contains(text: str, needle: str, compact_needle: str) -> bool:
     return bool(compact_needle and compact_needle in _compact_search_text(haystack))
 
 
-def _navidrome_params(payload: MediaServerCreateRequest | MediaServerConfig) -> dict[str, str]:
-    params = {"v": "1.16.1", "c": "MusicPilot", "f": "json"}
-    token = getattr(payload, "api_key", "")
-    username = getattr(payload, "username", "")
-    password = getattr(payload, "password", "")
-    if token:
-        params["token"] = token
-    if username and password:
-        salt = uuid4().hex
-        auth_token = hashlib.md5(f"{password}{salt}".encode()).hexdigest()
-        params.update({"u": username, "t": auth_token, "s": salt})
-    return params
-
-
 async def _poll_download_tasks(state: AppState) -> None:
     while True:
         try:
@@ -4206,7 +4212,7 @@ async def _poll_download_tasks(state: AppState) -> None:
 async def _sync_music_library_periodically(state: AppState) -> None:
     while True:
         try:
-            await _sync_music_library_from_navidrome(state)
+            await _sync_music_library_from_media_server(state)
         except Exception as exc:  # noqa: BLE001
             state.add_log("library", f"Music library sync failed: {exc}", "ERROR")
         await asyncio.sleep(MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS)
@@ -4215,49 +4221,66 @@ async def _sync_music_library_periodically(state: AppState) -> None:
 async def _sync_music_library_after_refresh(state: AppState) -> None:
     await asyncio.sleep(MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS)
     try:
-        await _sync_music_library_from_navidrome(state)
+        await _sync_music_library_from_media_server(state)
     except Exception as exc:  # noqa: BLE001
         state.add_log("library", f"Music library sync after refresh failed: {exc}", "ERROR")
 
 
-async def _sync_music_library_from_navidrome(state: AppState) -> int:
+async def _sync_music_library_from_media_server(state: AppState) -> int:
     server = await state.repository.default_media_server()
     if server is None:
         state.add_log("library", "Music library sync skipped: no media server", "WARNING")
         return 0
-    tracks = await _fetch_navidrome_music_library(server)
-    count = await state.repository.sync_music_library_tracks(tracks)
+    client = build_media_server_client(server)
+    tracks = await client.list_tracks()
+    count = await state.repository.sync_music_library_tracks(
+        [_media_server_track_payload(track) for track in tracks]
+    )
     await _refresh_playlist_library_matches(state)
     state.add_log("library", f"Music library synced: {count} track(s)")
     return count
 
 
-async def _fetch_navidrome_music_library(server: MediaServerConfig) -> list[dict[str, Any]]:
-    tracks: list[dict[str, Any]] = []
-    page_size = 500
-    offset = 0
-    async with httpx.AsyncClient(base_url=server.base_url.rstrip("/"), timeout=30) as client:
-        while True:
-            params = {
-                **_navidrome_params(server),
-                "query": "",
-                "artistCount": "0",
-                "albumCount": "0",
-                "songCount": str(page_size),
-                "songOffset": str(offset),
-            }
-            response = await client.get("/rest/search3.view", params=params)
-            response.raise_for_status()
-            payload = _validate_navidrome_json_response(response)
-            search_result = payload.get("searchResult3")
-            songs = search_result.get("song", []) if isinstance(search_result, dict) else []
-            if not isinstance(songs, list) or not songs:
-                break
-            tracks.extend(item for item in songs if isinstance(item, dict))
-            if len(songs) < page_size:
-                break
-            offset += page_size
-    return tracks
+def _media_server_track_payload(track: object) -> dict[str, Any]:
+    return {
+        "id": getattr(track, "id", ""),
+        "title": getattr(track, "title", ""),
+        "artist": getattr(track, "artist", None),
+        "album": getattr(track, "album", None),
+        "duration": getattr(track, "duration", None),
+        "size": getattr(track, "size", None),
+        "year": getattr(track, "year", None),
+        "suffix": getattr(track, "suffix", None),
+        "path": getattr(track, "path", None),
+        "contentType": getattr(track, "content_type", None),
+        "raw_payload": getattr(track, "raw_payload", {}),
+    }
+
+
+async def _sync_playlist_to_media_server(
+    state: AppState,
+    playlist: Playlist,
+) -> tuple[str | None, int]:
+    server = await state.repository.default_media_server()
+    if server is None:
+        raise ValueError("请先配置并启用默认媒体服务器。")
+    matched_tracks = await state.repository.list_matched_playlist_library_tracks(playlist.id)
+    song_ids = [
+        library_track.navidrome_id
+        for _, library_track in matched_tracks
+        if library_track.navidrome_id
+    ]
+    if not song_ids:
+        raise ValueError("该歌单没有已匹配到音乐库的歌曲。")
+    client = build_media_server_client(server)
+    result = await client.sync_playlist(name=playlist.name, song_ids=song_ids)
+    state.add_log(
+        "playlist",
+        "Playlist synced to music library: "
+        f"playlist_id={playlist.id}, name={playlist.name}, "
+        f"library_playlist_id={result.playlist_id or '-'}, tracks={result.synced_count}",
+    )
+    return result.playlist_id, result.synced_count
 
 
 async def _delete_task_torrent(
@@ -4506,7 +4529,7 @@ async def _scrape_manual_source_files(
     source_files: tuple[Path, ...],
 ) -> ScrapingSummary:
     try:
-        await _sync_music_library_from_navidrome(state)
+        await _sync_music_library_from_media_server(state)
     except Exception as exc:  # noqa: BLE001
         state.add_log(
             "library",
@@ -4730,11 +4753,14 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
         return
     try:
         state.add_log("library", f"Refreshing media library via {server.name}: {task.name}")
-        async with httpx.AsyncClient(base_url=server.base_url.rstrip("/"), timeout=30) as client:
-            response = await client.get("/rest/startScan.view", params=_navidrome_params(server))
-            _validate_navidrome_scan_response(response)
+        client = build_media_server_client(server)
+        await client.start_scan()
     except Exception as exc:  # noqa: BLE001
-        failed = await state.repository.update_download_task(task.id, status="failed", last_error=str(exc))
+        failed = await state.repository.update_download_task(
+            task.id,
+            status="failed",
+            last_error=str(exc),
+        )
         if failed is not None:
             await _sync_playlist_tracks_for_download_task(state, failed)
         state.add_log("library", f"Library refresh failed for {task.name}: {exc}", "ERROR")
@@ -4765,7 +4791,7 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Scr
         return
     try:
         try:
-            await _sync_music_library_from_navidrome(state)
+            await _sync_music_library_from_media_server(state)
         except Exception as exc:  # noqa: BLE001
             state.add_log("library", f"Music library sync before scraping failed: {exc}", "WARNING")
         library_tracks = tuple(
@@ -5150,46 +5176,6 @@ def _scraping_file_log_message(task_name: str, item: ScrapingFileResult) -> str:
     if item.error_message:
         parts.append(f"reason={item.error_message}")
     return ", ".join(parts)
-
-
-def _validate_navidrome_scan_response(response: httpx.Response) -> None:
-    response.raise_for_status()
-    body = _validate_navidrome_json_response(response)
-    status = str(body.get("status") or "").casefold()
-    if status == "ok":
-        return
-    raise RuntimeError(f"Navidrome scan failed: {_navidrome_error_message(body, status)}")
-
-
-def _validate_navidrome_json_response(response: httpx.Response) -> dict[str, object]:
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Navidrome returned a non-JSON response.") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Navidrome returned an invalid response.")
-    body = payload.get("subsonic-response")
-    if not isinstance(body, dict):
-        raise RuntimeError("Navidrome response is missing subsonic-response.")
-    status = str(body.get("status") or "").casefold()
-    if status == "ok":
-        return body
-    raise RuntimeError(f"Navidrome request failed: {_navidrome_error_message(body, status)}")
-
-
-def _navidrome_error_message(body: dict[str, object], status: str) -> str:
-    error = body.get("error")
-    message = ""
-    if isinstance(error, dict):
-        code = error.get("code")
-        detail = error.get("message")
-        if code and detail:
-            message = f"{code}: {detail}"
-        elif detail:
-            message = str(detail)
-    if not message:
-        message = f"unexpected status {status or '<missing>'}"
-    return message
 
 
 async def _send_event_notifications(

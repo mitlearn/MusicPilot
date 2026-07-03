@@ -302,6 +302,13 @@ type PlaylistTrack = {
   last_error?: string | null
 }
 
+type PlaylistLibrarySyncResponse = {
+  status: string
+  playlist_id: number
+  library_playlist_id?: string | null
+  synced_count: number
+}
+
 type PageResponse<T> = {
   items: T[]
   total: number
@@ -486,6 +493,7 @@ const availablePlaylistLoading = ref(false)
 const playlistTrackLoading = ref(false)
 const downloadItemsLoading = ref(false)
 const playlistDownloading = ref(false)
+const playlistLibrarySyncingIds = ref<number[]>([])
 const playlistTrackDownloadingIds = ref<number[]>([])
 const deleting = ref(false)
 const downloadDeleting = ref(false)
@@ -1886,6 +1894,26 @@ async function syncPlaylist(playlist: Playlist) {
     notify(error instanceof Error ? error.message : '歌单同步失败', 'error')
   } finally {
     playlistLoading.value = false
+  }
+}
+
+function isPlaylistSyncingToLibrary(playlistId: number) {
+  return playlistLibrarySyncingIds.value.includes(playlistId)
+}
+
+async function syncPlaylistToLibrary(playlist: Playlist) {
+  if (isPlaylistSyncingToLibrary(playlist.id)) return
+  playlistLibrarySyncingIds.value = [...playlistLibrarySyncingIds.value, playlist.id]
+  try {
+    const response = await api<PlaylistLibrarySyncResponse>(
+      `/api/playlists/${playlist.id}/sync-to-library`,
+      { method: 'POST' }
+    )
+    notify(`已同步到音乐库歌单：${response.synced_count} 首`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '同步到音乐库失败', 'error')
+  } finally {
+    playlistLibrarySyncingIds.value = playlistLibrarySyncingIds.value.filter((id) => id !== playlist.id)
   }
 }
 
@@ -3408,8 +3436,17 @@ onUnmounted(() => {
                         color="primary"
                         variant="text"
                         size="small"
-                        title="同步"
+                        title="同步来源"
                         @click="syncPlaylist(playlist)"
+                      />
+                      <v-btn
+                        icon="mdi-playlist-check"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="同步到音乐库"
+                        :loading="isPlaylistSyncingToLibrary(playlist.id)"
+                        @click="syncPlaylistToLibrary(playlist)"
                       />
                       <v-btn
                         icon="mdi-download"
@@ -4851,10 +4888,10 @@ onUnmounted(() => {
 }
 
 .playlist-action-col {
-  min-width: 220px;
+  min-width: 260px;
   right: 0;
   text-align: center;
-  width: 220px;
+  width: 260px;
 }
 
 .sticky-action-col,
