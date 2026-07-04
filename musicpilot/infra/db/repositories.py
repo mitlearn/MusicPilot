@@ -468,12 +468,8 @@ class SqlAlchemyMediaRepository:
             claimed_keys: list[str] = []
             try:
                 for resource_key in resource_keys:
-                    lease = await session.get(SystemTaskResourceLease, resource_key)
-                    if lease is not None and _as_utc(lease.lease_until) <= now:
-                        await session.delete(lease)
-                        await session.flush()
-                        lease = None
                     if resource_key == task.inheritable_key:
+                        lease = await _get_active_resource_lease(session, resource_key, now)
                         if (
                             lease is not None
                             and lease.holder_kind == "chain"
@@ -495,19 +491,18 @@ class SqlAlchemyMediaRepository:
                         )
                         claimed_keys.append(resource_key)
                         continue
-                    if lease is not None:
-                        return None
-                    session.add(
-                        SystemTaskResourceLease(
-                            resource_key=resource_key,
-                            holder_kind="task",
-                            holder_id=str(task.id),
-                            task_id=task.id,
-                            chain_id=task.chain_id,
-                            lease_until=lease_until,
-                        )
+                    claimed_key = await _claim_task_resource_lease(
+                        session,
+                        resource_key=resource_key,
+                        task_id=task.id,
+                        chain_id=task.chain_id,
+                        lease_until=lease_until,
+                        now=now,
                     )
-                    claimed_keys.append(resource_key)
+                    if claimed_key is None:
+                        await session.rollback()
+                        return None
+                    claimed_keys.append(claimed_key)
                 task.status = "RUNNING"
                 task.attempts += 1
                 task.started_at = now
@@ -572,12 +567,8 @@ class SqlAlchemyMediaRepository:
                 session.add(row)
                 await session.flush()
                 for resource_key in resource_values:
-                    lease = await session.get(SystemTaskResourceLease, resource_key)
-                    if lease is not None and _as_utc(lease.lease_until) <= now:
-                        await session.delete(lease)
-                        await session.flush()
-                        lease = None
                     if resource_key == inheritable_key:
+                        lease = await _get_active_resource_lease(session, resource_key, now)
                         if lease is not None:
                             await session.rollback()
                             return None
@@ -593,20 +584,18 @@ class SqlAlchemyMediaRepository:
                         )
                         claimed_keys.append(resource_key)
                         continue
-                    if lease is not None:
+                    claimed_key = await _claim_task_resource_lease(
+                        session,
+                        resource_key=resource_key,
+                        task_id=row.id,
+                        chain_id=chain_value,
+                        lease_until=lease_until,
+                        now=now,
+                    )
+                    if claimed_key is None:
                         await session.rollback()
                         return None
-                    session.add(
-                        SystemTaskResourceLease(
-                            resource_key=resource_key,
-                            holder_kind="task",
-                            holder_id=str(row.id),
-                            task_id=row.id,
-                            chain_id=chain_value,
-                            lease_until=lease_until,
-                        )
-                    )
-                    claimed_keys.append(resource_key)
+                    claimed_keys.append(claimed_key)
                 await session.commit()
                 await session.refresh(row)
                 logger.info(
@@ -1915,6 +1904,59 @@ def _unique_strings(values: object) -> list[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _pooled_resource_slots(resource_key: str) -> tuple[str, ...]:
+    parts = resource_key.split(":", 2)
+    if len(parts) != 3 or parts[0] != "pool":
+        return ()
+    limit = _optional_int(parts[1]) or 1
+    limit = min(max(limit, 1), 20)
+    base_key = parts[2].strip()
+    if not base_key:
+        return ()
+    return tuple(f"{base_key}:slot:{index}" for index in range(limit))
+
+
+async def _get_active_resource_lease(
+    session: object,
+    resource_key: str,
+    now: datetime,
+) -> SystemTaskResourceLease | None:
+    lease = await session.get(SystemTaskResourceLease, resource_key)
+    if lease is not None and _as_utc(lease.lease_until) <= now:
+        await session.delete(lease)
+        await session.flush()
+        return None
+    return lease
+
+
+async def _claim_task_resource_lease(
+    session: object,
+    *,
+    resource_key: str,
+    task_id: int,
+    chain_id: str,
+    lease_until: datetime,
+    now: datetime,
+) -> str | None:
+    candidate_keys = _pooled_resource_slots(resource_key) or (resource_key,)
+    for candidate_key in candidate_keys:
+        lease = await _get_active_resource_lease(session, candidate_key, now)
+        if lease is not None:
+            continue
+        session.add(
+            SystemTaskResourceLease(
+                resource_key=candidate_key,
+                holder_kind="task",
+                holder_id=str(task_id),
+                task_id=task_id,
+                chain_id=chain_id,
+                lease_until=lease_until,
+            )
+        )
+        return candidate_key
+    return None
 
 
 def _as_utc(value: datetime) -> datetime:

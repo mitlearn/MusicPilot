@@ -2933,19 +2933,19 @@ async def _playlist_track_download_resource_keys(
     return tuple(f"artist:{key}" for key in artist_keys)
 
 
-async def _media_candidate_artist_resource_keys(
-    state: AppState,
-    media: MediaCandidateResponse,
-) -> tuple[str, ...]:
-    artist_names = split_artist_credit(media.artist)
-    keys: list[str] = []
-    for artist in artist_names:
-        canonical = await state.artist_service.get_canonical_name(artist)
-        normalized = normalize_artist_name(canonical or artist)
-        compact = _compact_search_text(normalized)
-        if compact and compact not in keys:
-            keys.append(compact)
-    return tuple(f"artist:{key}" for key in keys)
+def _site_resource_key(indexer: object, site_id: str) -> str:
+    max_concurrency = _optional_int(
+        getattr(getattr(indexer, "config", None), "max_concurrency", 1)
+    ) or 1
+    max_concurrency = max(1, max_concurrency)
+    return f"pool:{max_concurrency}:site:{site_id}"
+
+
+def _media_search_resource_key(query: str) -> str:
+    normalized = _compact_search_text(normalize_search_text(query))
+    if normalized:
+        return f"media-search:{normalized[:120]}"
+    return "media-search:empty"
 
 
 async def _playlist_has_active_downloads(state: AppState, playlist_id: int) -> bool:
@@ -3506,7 +3506,7 @@ async def _search_indexer(
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_SITE",
-            resource_keys=[f"site:{site_id}"],
+            resource_keys=[_site_resource_key(indexer, site_id)],
             payload={
                 "site_id": site_id,
                 "site_name": site_name,
@@ -3539,10 +3539,7 @@ async def _search_site_candidates(
         getattr(getattr(indexer, "config", None), "site_id", "") or indexer.name
     )
     site_name = str(getattr(indexer, "name", site_id))
-    resource_keys = [
-        f"site:{site_id}",
-        *await _media_candidate_artist_resource_keys(state, media),
-    ]
+    resource_keys = [_site_resource_key(indexer, site_id)]
     if not use_task_manager:
         source, results_list, errors = await state.task_manager.run_exclusive(
             task_type="SEARCH_SITE_CANDIDATES",
@@ -3635,7 +3632,7 @@ async def _search_media_candidates(
     if not use_task_manager:
         return await state.task_manager.run_exclusive(
             task_type="SEARCH_MEDIA",
-            resource_keys=["media-search"],
+            resource_keys=[_media_search_resource_key(query)],
             payload={
                 "query": query,
                 "limit": limit,
@@ -3647,7 +3644,7 @@ async def _search_media_candidates(
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_MEDIA",
-            resource_keys=["media-search"],
+            resource_keys=[_media_search_resource_key(query)],
             payload={
                 "query": query,
                 "limit": limit,

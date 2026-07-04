@@ -281,7 +281,9 @@ class TaskManager:
         available_slots = self.max_concurrent_tasks - len(self._running_tasks)
         if available_slots <= 0:
             return False
-        tasks = await self.repository.list_ready_system_tasks(limit=max(available_slots * 2, 1))
+        tasks = await self.repository.list_ready_system_tasks(
+            limit=max(available_slots * 8, 32)
+        )
         if not tasks:
             return False
         scheduled = False
