@@ -706,6 +706,13 @@ const mediaServerForm = ref({
   enabled: true
 })
 
+const mediaServerUserForm = ref({
+  id: null as string | null,
+  username: '',
+  password: '',
+  enabled: true
+})
+
 const notifierForm = ref({
   id: null as string | null,
   name: 'Telegram Bot',
@@ -854,6 +861,17 @@ const enabledMediaServerOptions = computed(() =>
       subtitle: item.name,
       value: item.id || ''
     }))
+)
+
+const defaultMediaServer = computed(() =>
+  mediaServers.value.find((item) => item.is_default) ?? mediaServers.value[0] ?? null
+)
+
+const mediaServerUserAccounts = computed(() =>
+  [...mediaServers.value].sort((left, right) => {
+    if (left.is_default !== right.is_default) return left.is_default ? -1 : 1
+    return (left.username || left.name).localeCompare(right.username || right.name)
+  })
 )
 
 const dashboardMetricCards = computed<DashboardMetric[]>(() => {
@@ -2348,7 +2366,7 @@ async function syncPlaylistToLibrary() {
   if (!playlist) return
   if (isPlaylistSyncingToLibrary(playlist.id)) return
   if (!playlistLibrarySyncForm.value.media_server_id) {
-    notify('请选择同步用户', 'warning')
+    notify('请选择同步账号', 'warning')
     return
   }
   playlistLibrarySyncingIds.value = [...playlistLibrarySyncingIds.value, playlist.id]
@@ -2669,10 +2687,29 @@ function openDeleteDownloader(downloader: DownloaderConfig) {
 
 async function loadMediaServers() {
   mediaServers.value = await api<MediaServerConfig[]>('/api/settings/media-servers')
+  syncMediaServerFormFromDefault()
 }
 
-function openNewMediaServerDialog() {
-  editingMediaServerId.value = null
+function syncMediaServerFormFromDefault() {
+  const server = defaultMediaServer.value
+  if (!server) {
+    resetMediaServerForm()
+    return
+  }
+  mediaServerForm.value = {
+    id: server.id ?? null,
+    name: server.name,
+    type: server.type,
+    base_url: server.base_url,
+    api_key: server.api_key,
+    username: server.username,
+    password: '',
+    is_default: true,
+    enabled: server.enabled
+  }
+}
+
+function resetMediaServerForm() {
   mediaServerForm.value = {
     id: null,
     name: 'Navidrome',
@@ -2684,23 +2721,70 @@ function openNewMediaServerDialog() {
     is_default: true,
     enabled: true
   }
+}
+
+function openNewMediaServerUserDialog() {
+  if (!mediaServerForm.value.id) {
+    notify('请先保存音乐库配置', 'warning')
+    return
+  }
+  editingMediaServerId.value = null
+  mediaServerUserForm.value = {
+    id: null,
+    username: '',
+    password: '',
+    enabled: true
+  }
   mediaServerDialog.value = true
 }
 
-function editMediaServer(server: MediaServerConfig) {
+function editMediaServerUser(server: MediaServerConfig) {
+  if (server.is_default) {
+    syncMediaServerFormFromDefault()
+    return
+  }
   editingMediaServerId.value = server.id ?? null
-  mediaServerForm.value = {
+  mediaServerUserForm.value = {
     id: server.id ?? null,
-    name: server.name,
-    type: server.type,
-    base_url: server.base_url,
-    api_key: server.api_key,
     username: server.username,
     password: '',
-    is_default: server.is_default,
     enabled: server.enabled
   }
   mediaServerDialog.value = true
+}
+
+function mediaServerUserPayload() {
+  const username = trimmedInput(mediaServerUserForm.value.username)
+  return {
+    id: mediaServerUserForm.value.id,
+    name: username || 'Navidrome 用户',
+    type: mediaServerForm.value.type,
+    base_url: mediaServerForm.value.base_url,
+    api_key: mediaServerForm.value.api_key,
+    username,
+    password: mediaServerUserForm.value.password,
+    is_default: false,
+    enabled: mediaServerUserForm.value.enabled
+  }
+}
+
+async function syncMediaServerUsersToMainConfig(mainServer: MediaServerConfig) {
+  const userServers = mediaServers.value.filter((item) => item.id && !item.is_default)
+  await Promise.all(
+    userServers.map((item) =>
+      api<MediaServerConfig>(`/api/settings/media-servers/${item.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          ...item,
+          type: mainServer.type,
+          base_url: mainServer.base_url,
+          api_key: mainServer.api_key,
+          is_default: false,
+          password: ''
+        })
+      })
+    )
+  )
 }
 
 async function testMediaServer() {
@@ -2708,7 +2792,10 @@ async function testMediaServer() {
   try {
     const result = await api<TestResponse>('/api/settings/media-servers/test', {
       method: 'POST',
-      body: JSON.stringify(mediaServerForm.value)
+      body: JSON.stringify({
+        ...mediaServerForm.value,
+        is_default: true
+      })
     })
     notify(result.message, result.ok ? 'success' : 'error')
   } catch (error) {
@@ -2719,23 +2806,63 @@ async function testMediaServer() {
 }
 
 async function saveMediaServer() {
-  const editing = Boolean(editingMediaServerId.value)
+  const editing = Boolean(mediaServerForm.value.id)
   const server = await api<MediaServerConfig>(
+    editing
+      ? `/api/settings/media-servers/${mediaServerForm.value.id}`
+      : '/api/settings/media-servers',
+    {
+      method: editing ? 'PUT' : 'POST',
+      body: JSON.stringify({
+        ...mediaServerForm.value,
+        is_default: true
+      })
+    }
+  )
+  await syncMediaServerUsersToMainConfig(server)
+  await loadMediaServers()
+  notify('音乐库配置已保存')
+}
+
+async function testMediaServerUser() {
+  const payload = mediaServerUserPayload()
+  if (!payload.username) {
+    notify('用户名不能为空', 'warning')
+    return
+  }
+  mediaServerTesting.value = true
+  try {
+    const result = await api<TestResponse>('/api/settings/media-servers/test', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+    notify(result.message, result.ok ? 'success' : 'error')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '音乐库用户测试失败', 'error')
+  } finally {
+    mediaServerTesting.value = false
+  }
+}
+
+async function saveMediaServerUser() {
+  const payload = mediaServerUserPayload()
+  if (!payload.username) {
+    notify('用户名不能为空', 'warning')
+    return
+  }
+  const editing = Boolean(editingMediaServerId.value)
+  await api<MediaServerConfig>(
     editing
       ? `/api/settings/media-servers/${editingMediaServerId.value}`
       : '/api/settings/media-servers',
     {
       method: editing ? 'PUT' : 'POST',
-      body: JSON.stringify(mediaServerForm.value)
+      body: JSON.stringify(payload)
     }
   )
-  if (editing) {
-    mediaServers.value = mediaServers.value.map((item) => (item.id === server.id ? server : item))
-  } else {
-    mediaServers.value.push(server)
-  }
+  await loadMediaServers()
   mediaServerDialog.value = false
-  notify('媒体服务器已保存')
+  notify('音乐库用户已保存')
 }
 
 function openDeleteMediaServer(server: MediaServerConfig) {
@@ -4385,7 +4512,7 @@ onUnmounted(() => {
           <section v-if="activePage === 'settings'" class="page-stack">
             <v-tabs v-model="settingsTab" color="primary">
               <v-tab value="downloaders">下载器</v-tab>
-              <v-tab value="mediaServers">媒体服务器</v-tab>
+              <v-tab value="mediaServers">音乐库</v-tab>
               <v-tab value="notifiers">通知</v-tab>
               <v-tab value="system">系统设置</v-tab>
             </v-tabs>
@@ -4436,46 +4563,106 @@ onUnmounted(() => {
               </v-window-item>
 
               <v-window-item value="mediaServers">
-                <div class="toolbar-row">
-                  <v-btn color="primary" prepend-icon="mdi-plus" @click="openNewMediaServerDialog">新增媒体服务器</v-btn>
-                </div>
-                <div class="card-grid">
-                  <v-card
-                    v-for="server in mediaServers"
-                    :key="server.id || server.base_url"
-                    class="config-card"
-                    @click="editMediaServer(server)"
-                  >
-                    <v-card-title class="config-card-title d-flex align-center">
-                      <span>{{ server.name }}</span>
-                      <v-spacer />
-                      <div v-if="server.id" class="config-card-menu" @click.stop>
-                        <v-btn
-                          icon="mdi-dots-vertical"
-                          size="small"
-                          variant="text"
-                          @click.stop="toggleConfigMenu('mediaServer', server.id)"
-                        />
-                        <v-card
-                          v-if="activeConfigMenu === configMenuKey('mediaServer', server.id)"
-                          class="config-card-menu-panel"
-                          elevation="0"
-                          @click.stop
-                        >
-                          <button class="config-card-menu-item" type="button" @click="openDeleteMediaServer(server)">
-                            删除
-                          </button>
-                        </v-card>
-                      </div>
-                    </v-card-title>
-                    <v-card-text>
-                      <div class="muted">{{ server.base_url }}</div>
-                      <v-chip size="small" variant="tonal">{{ server.type }}</v-chip>
-                      <v-chip v-if="server.is_default" color="success" size="small" variant="tonal">默认</v-chip>
-                      <v-chip v-if="!server.enabled" color="warning" size="small" variant="tonal">停用</v-chip>
-                    </v-card-text>
-                  </v-card>
-                </div>
+                <v-card class="settings-card">
+                  <v-card-title>音乐库配置</v-card-title>
+                  <v-card-text class="settings-grid">
+                    <v-select v-model="mediaServerForm.type" :items="['navidrome']" label="类型" />
+                    <v-text-field v-model="mediaServerForm.name" label="名称" />
+                    <v-text-field v-model="mediaServerForm.base_url" label="地址" />
+                    <v-text-field v-model="mediaServerForm.api_key" label="API Token" />
+                    <v-text-field v-model="mediaServerForm.username" label="默认用户名" />
+                    <v-text-field
+                      v-model="mediaServerForm.password"
+                      label="默认用户密码"
+                      type="password"
+                      :placeholder="mediaServerForm.id ? '留空则保持原密码' : ''"
+                    />
+                    <v-switch
+                      v-model="mediaServerForm.enabled"
+                      class="compact-switch"
+                      color="primary"
+                      density="compact"
+                      hide-details
+                      inset
+                      label="启用"
+                    />
+                  </v-card-text>
+                  <v-card-actions>
+                    <v-spacer />
+                    <v-btn :loading="mediaServerTesting" variant="tonal" @click="testMediaServer">
+                      测试
+                    </v-btn>
+                    <v-btn color="primary" @click="saveMediaServer">
+                      保存
+                    </v-btn>
+                  </v-card-actions>
+                </v-card>
+
+                <v-card class="settings-card mt-4">
+                  <v-card-title class="d-flex align-center">
+                    <span>用户账号</span>
+                    <v-spacer />
+                    <v-btn
+                      color="primary"
+                      prepend-icon="mdi-account-plus"
+                      variant="tonal"
+                      @click="openNewMediaServerUserDialog"
+                    >
+                      新增用户
+                    </v-btn>
+                  </v-card-title>
+                  <v-table>
+                    <thead>
+                      <tr>
+                        <th>用户名</th>
+                        <th>状态</th>
+                        <th>类型</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-if="!mediaServerUserAccounts.length">
+                        <td colspan="4" class="empty-cell">保存音乐库配置后会生成默认用户</td>
+                      </tr>
+                      <tr v-for="server in mediaServerUserAccounts" :key="server.id || server.username">
+                        <td>
+                          <div class="font-weight-medium">{{ server.username || '-' }}</div>
+                          <div class="muted">{{ server.is_default ? '默认账号' : server.name }}</div>
+                        </td>
+                        <td>
+                          <v-chip
+                            :color="server.enabled ? 'success' : 'warning'"
+                            size="small"
+                            variant="tonal"
+                          >
+                            {{ server.enabled ? '启用' : '停用' }}
+                          </v-chip>
+                        </td>
+                        <td>{{ server.type }}</td>
+                        <td class="table-actions">
+                          <v-btn
+                            icon="mdi-pencil-outline"
+                            color="primary"
+                            variant="text"
+                            size="small"
+                            :title="server.is_default ? '默认账号请在上方编辑' : '编辑用户'"
+                            :disabled="server.is_default"
+                            @click="editMediaServerUser(server)"
+                          />
+                          <v-btn
+                            icon="mdi-delete-outline"
+                            color="error"
+                            variant="text"
+                            size="small"
+                            title="删除用户"
+                            :disabled="server.is_default"
+                            @click="openDeleteMediaServer(server)"
+                          />
+                        </td>
+                      </tr>
+                    </tbody>
+                  </v-table>
+                </v-card>
               </v-window-item>
 
               <v-window-item value="notifiers">
@@ -5089,8 +5276,8 @@ onUnmounted(() => {
             :items="enabledMediaServerOptions"
             item-title="title"
             item-value="value"
-            label="同步用户"
-            no-data-text="暂无已启用的媒体服务器用户"
+            label="同步账号"
+            no-data-text="暂无已启用的音乐库账号"
           />
           <v-switch
             v-model="playlistLibrarySyncForm.public"
@@ -5188,27 +5375,27 @@ onUnmounted(() => {
     </v-dialog>
 
     <v-dialog v-model="mediaServerDialog" max-width="560">
-      <v-card :title="editingMediaServerId ? '编辑媒体服务器' : '新增媒体服务器'">
+      <v-card :title="editingMediaServerId ? '编辑音乐库用户' : '新增音乐库用户'">
         <v-card-text class="dialog-stack">
-          <v-select v-model="mediaServerForm.type" :items="['navidrome']" label="类型" />
-          <v-text-field v-model="mediaServerForm.name" label="名称" />
-          <v-text-field v-model="mediaServerForm.base_url" label="地址" />
-          <v-text-field v-model="mediaServerForm.api_key" label="API Token" />
-          <v-text-field v-model="mediaServerForm.username" label="用户名" />
+          <v-text-field v-model="mediaServerUserForm.username" label="用户名" autofocus />
           <v-text-field
-            v-model="mediaServerForm.password"
+            v-model="mediaServerUserForm.password"
             label="密码"
             type="password"
             :placeholder="editingMediaServerId ? '留空则保持原密码' : ''"
           />
-          <v-switch v-model="mediaServerForm.is_default" color="primary" label="设为默认" hide-details />
-          <v-switch v-model="mediaServerForm.enabled" color="primary" label="启用" hide-details />
+          <v-switch
+            v-model="mediaServerUserForm.enabled"
+            color="primary"
+            label="启用"
+            hide-details
+          />
         </v-card-text>
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="mediaServerDialog = false">取消</v-btn>
-          <v-btn :loading="mediaServerTesting" variant="tonal" @click="testMediaServer">测试</v-btn>
-          <v-btn color="primary" @click="saveMediaServer">保存</v-btn>
+          <v-btn :loading="mediaServerTesting" variant="tonal" @click="testMediaServerUser">测试</v-btn>
+          <v-btn color="primary" @click="saveMediaServerUser">保存</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
