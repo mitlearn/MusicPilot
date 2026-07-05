@@ -2082,10 +2082,11 @@ def create_app() -> FastAPI:
         if not source_is_audio:
             raise HTTPException(status_code=404, detail="源音频文件不存在，无法手动整理。")
         metadata = _track_metadata_from_manual_payload(payload)
-        exclude_library_paths: tuple[Path, ...] = ()
-        existing_media = await state.repository.get_media_file_by_source_path(source_path)
-        if existing_media is not None:
-            exclude_library_paths = await _prepare_media_record_reorganize(state, existing_media)
+        exclude_library_paths = await _prepare_source_file_reorganize(
+            state,
+            source_path,
+            config,
+        )
         try:
             task_id = await state.task_manager.enqueue(
                 TaskCreate(
@@ -2144,11 +2145,9 @@ def create_app() -> FastAPI:
         )
         exclude_paths: list[Path] = []
         for source_file in source_files:
-            existing_media = await state.repository.get_media_file_by_source_path(source_file)
-            if existing_media is not None:
-                exclude_paths.extend(
-                    await _prepare_media_record_reorganize(state, existing_media)
-                )
+            exclude_paths.extend(
+                await _prepare_source_file_reorganize(state, source_file, config)
+            )
         try:
             task_id = await state.task_manager.enqueue(
                 TaskCreate(
@@ -2298,7 +2297,7 @@ def create_app() -> FastAPI:
         if not config.enabled:
             raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削")
         metadata = _track_metadata_from_manual_payload(payload)
-        exclude_library_paths = await _prepare_media_record_reorganize(state, media)
+        exclude_library_paths = await _prepare_media_record_reorganize(state, media, config)
         try:
             task_id = await state.task_manager.enqueue(
                 TaskCreate(
@@ -5268,19 +5267,81 @@ async def _delete_media_record(
     return await state.repository.delete_media_file(media.id)
 
 
-async def _prepare_media_record_reorganize(state: AppState, media: MediaFile) -> tuple[Path, ...]:
+async def _prepare_source_file_reorganize(
+    state: AppState,
+    source_path: Path,
+    config: ScrapingConfig,
+) -> tuple[Path, ...]:
+    source_roots = tuple(path for path in (config.source_directory,) if path is not None)
+    source_keys = _path_match_keys(source_path, source_roots)
+    exclude_paths: list[Path] = []
+    seen_ids: set[int] = set()
+    for media in await state.repository.list_media_files():
+        if media.id in seen_ids:
+            continue
+        if not _path_matches_any_key(media.source_path, source_keys, source_roots):
+            continue
+        seen_ids.add(media.id)
+        exclude_paths.extend(await _prepare_media_record_reorganize(state, media, config))
+    return tuple(exclude_paths)
+
+
+async def _prepare_media_record_reorganize(
+    state: AppState,
+    media: MediaFile,
+    config: ScrapingConfig,
+) -> tuple[Path, ...]:
     exclude_paths: list[Path] = []
     if media.library_path:
-        library_path = Path(media.library_path)
-        exclude_paths.append(library_path)
-        if media.status == "success" and not await asyncio.to_thread(
-            _paths_are_same_file,
-            library_path,
-            Path(media.source_path),
-        ):
+        library_paths = _media_library_path_candidates(media.library_path, config)
+        exclude_paths.extend(library_paths)
+        for library_path in library_paths:
+            if media.status != "success":
+                continue
+            if await asyncio.to_thread(
+                _paths_are_same_file,
+                library_path,
+                Path(media.source_path),
+            ):
+                continue
             await _delete_file_path(library_path)
+            break
+    elif media.error_message:
+        legacy_paths = _media_existing_path_candidates(media.error_message, config)
+        exclude_paths.extend(legacy_paths)
+        for legacy_path in legacy_paths:
+            await _delete_file_path(legacy_path)
+            break
     await state.repository.delete_media_file(media.id)
     return tuple(exclude_paths)
+
+
+def _media_existing_path_candidates(message: str, config: ScrapingConfig) -> tuple[Path, ...]:
+    match = re.search(r"(?:已存在路径|原路径)=([^，]+)", message)
+    if match is None:
+        return ()
+    return _media_library_path_candidates(match.group(1).strip(), config)
+
+
+def _media_library_path_candidates(value: str, config: ScrapingConfig) -> tuple[Path, ...]:
+    raw = Path(value)
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        for root in (config.mapped_directory, config.source_directory):
+            if root is not None:
+                candidates.append(root / raw)
+        candidates.append(raw)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = _normalized_path_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return tuple(deduped)
 
 
 def _paths_are_same_file(left: Path, right: Path) -> bool:
