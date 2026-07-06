@@ -10,7 +10,7 @@ Language: [简体中文](README.md) | [English](README_EN.md)
 
 MusicPilot is a self-hosted music library automation tool that turns music discovery, resource search, download submission, file organization, metadata completion, library refresh, and playlist sync into one manageable workflow.
 
-It is designed for users who already run services such as PT sites, qBittorrent, and Navidrome. MusicPilot does not replace those systems. Instead, it connects them and reduces repeated manual work around searching, downloading, organizing files, and refreshing the music library.
+It is designed for users who already run their own music library, downloader, and resource sites. MusicPilot does not replace those systems and does not provide download channels. Instead, it connects existing services and reduces repeated manual work around searching, downloading, organizing files, and refreshing the music library.
 
 Core goals:
 
@@ -19,7 +19,22 @@ Core goals:
 3. Keep deployment simple, use SQLite by default, and support Docker Compose on NAS devices or servers.
 4. Keep clear adapter boundaries so more sites, downloaders, music platforms, metadata sources, and media servers can be added later.
 
-## 2. Features
+## 2. Supported Integrations
+
+Media library support:
+
+- [x] Navidrome
+
+Downloader support:
+
+- [x] qBittorrent
+
+Site support:
+
+- [x] OpenCD
+- [x] HDFans
+
+## 3. Features
 
 MusicPilot currently provides the following capabilities:
 
@@ -53,11 +68,49 @@ MusicPilot currently provides the following capabilities:
    - View logs, dashboard statistics, and file management pages.
    - Control basic deployment parameters through Docker environment variables.
 
-## 3. Workflow
+## 4. Workflow
 
 ![MusicPilot workflow](docs/assets/musicpilot-workflow.png)
 
-## 4. Quick Start
+## 5. Screenshots
+
+### 5.1. Dashboard
+
+The dashboard summarizes library size, tracks added in the last 7 days, playlist count, active downloads, organization records, and task queue health. The recent downloads and recent organization sections make it easier to confirm whether automation is progressing normally and whether failed tasks need manual handling.
+
+![MusicPilot dashboard](docs/assets/screenshots/dashboard.png)
+
+### 5.2. Search and Site Selection
+
+The search page shows music metadata candidates first, then asks the user to confirm which sites should be searched. The confirmation dialog keeps the media details and album list visible so the title, artist, and album clues can be checked before submitting a site search.
+
+![MusicPilot search](docs/assets/screenshots/search.png)
+
+### 5.3. Download Tasks
+
+The downloads page shows submitted tasks with their status, progress, save path, and actions. Users can refresh task status, filter active tasks, open task details, or delete records that are no longer needed.
+
+![MusicPilot downloads](docs/assets/screenshots/downloads.png)
+
+### 5.4. File Management
+
+The file management page is used to browse source files or target music library directories. It supports directory switching, file search, list refresh, batch organization, and deletion. Each file or directory keeps its type, size, modification time, and organization actions so users can manually intervene in the automated organization flow.
+
+![MusicPilot media files](docs/assets/screenshots/media-files.png)
+
+### 5.5. Playlist Management
+
+The playlists page shows the local state of imported external playlists, including source platform, track count, existing tracks, pending tracks, submitted tasks, failures, and sync status. The action area provides entry points for details, match refresh, download submission, sync, and deletion.
+
+![MusicPilot playlists](docs/assets/screenshots/playlists.png)
+
+### 5.6. System Settings
+
+The settings page groups runtime parameters by downloader, music library, notification, and system settings. System settings include proxy configuration, scraping switches, source directory, mapped directory, and missing-field handling, which control resource organization and metadata completion behavior.
+
+![MusicPilot settings](docs/assets/screenshots/settings.png)
+
+## 6. Quick Start
 
 The following workflow is suitable for building and running MusicPilot directly from source on a NAS or server.
 
@@ -124,7 +177,7 @@ git pull
 docker compose up -d --build
 ```
 
-### 4.1. Optional PostgreSQL Database
+### 6.1. Optional PostgreSQL Database
 
 MusicPilot uses SQLite by default, which fits single-host and NAS deployments. For higher concurrency or an external database, change `MP_DATABASE_URL` in `.env` to a PostgreSQL connection string:
 
@@ -134,7 +187,7 @@ MP_DATABASE_URL=postgresql+asyncpg://musicpilot:change-this-password@postgres:54
 
 Create the PostgreSQL database and user before starting MusicPilot. On startup, MusicPilot runs Alembic to initialize or upgrade the schema.
 
-### 4.2. Configuration Guide
+### 6.2. Configuration Guide
 
 After the first startup, configure sites, downloaders, music libraries, organization rules, and notification channels in the Web UI.
 
@@ -142,7 +195,15 @@ Configuration guide entry: [MusicPilot Configuration Guide](docs/configuration.e
 
 This document will collect the configuration steps. For now, only the entry is provided, and detailed content will be added later.
 
-## 5. Acknowledgements
+## 7. Disclaimer
+
+- This project is only a self-hosted music library organization and management tool. It does not directly provide, store, publish, or distribute any music resources, and it does not provide any download channels.
+- This project only connects the media libraries, downloaders, sites, and metadata sources configured by users. Users must confirm the legality of their accounts, sites, resources, and files, and assume all responsibility for their own usage.
+- This project is intended only for learning, discussion, and personal self-hosted usage. It must not be used for commercial purposes or any illegal activity.
+- This project is open source. Any risks or liabilities caused by modification, redistribution, propagation, or removal of restrictions are the responsibility of the corresponding modifier, distributor, or user.
+- This project does not accept donations, does not provide paid services, and does not publish any payment or donation entry anywhere. Please verify information carefully to avoid being misled.
+
+## 8. Acknowledgements
 
 MusicPilot's design and implementation reference many excellent open-source projects. Special thanks to:
 
