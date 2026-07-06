@@ -490,7 +490,7 @@ type ConfigMenuKind = DeleteTarget['kind']
 
 const loggedIn = ref(false)
 const loginLoading = ref(false)
-const loginForm = ref({ username: 'admin', password: 'musicpilot' })
+const loginForm = ref({ username: '', password: '' })
 const activePage = ref('dashboard')
 const settingsTab = ref('downloaders')
 const drawer = ref(true)
