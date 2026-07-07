@@ -664,6 +664,14 @@ const fileDeleting = ref(false)
 const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
 const activeMediaDeleteMode = ref<MediaDeleteMode | null>(null)
 const systemSaving = ref(false)
+const databaseExporting = ref(false)
+const databaseImporting = ref(false)
+const databaseImportStartDialog = ref(false)
+const databaseImportFileDialog = ref(false)
+const databaseImportSecondConfirm = ref(false)
+const databaseImportDragging = ref(false)
+const databaseImportFile = ref<File | null>(null)
+const databaseImportFileInput = ref<HTMLInputElement | null>(null)
 const artists = ref<Artist[]>([])
 const artistQuery = ref('')
 const artistPage = ref(1)
@@ -3350,6 +3358,137 @@ async function saveSystemSettings() {
   }
 }
 
+async function exportDatabase() {
+  databaseExporting.value = true
+  try {
+    const response = await fetch('/api/settings/database/export', {
+      credentials: 'include'
+    })
+    if (!response.ok) {
+      throw new Error(await readError(response))
+    }
+    const blob = await response.blob()
+    const disposition = response.headers.get('Content-Disposition') ?? ''
+    const filename = databaseExportFilename(disposition)
+    const link = document.createElement('a')
+    const url = URL.createObjectURL(blob)
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+    notify('数据库已导出')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '数据库导出失败', 'error')
+  } finally {
+    databaseExporting.value = false
+  }
+}
+
+function openDatabaseImportStartDialog() {
+  databaseImportStartDialog.value = true
+}
+
+function confirmDatabaseImportStart() {
+  databaseImportStartDialog.value = false
+  resetDatabaseImportSelection()
+  databaseImportFileDialog.value = true
+}
+
+function selectedDatabaseImportFile() {
+  return databaseImportFile.value
+}
+
+function openDatabaseImportFilePicker() {
+  databaseImportFileInput.value?.click()
+}
+
+function handleDatabaseImportFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0] ?? null
+  if (file) {
+    setDatabaseImportFile(file)
+  }
+}
+
+function handleDatabaseImportDrop(event: DragEvent) {
+  databaseImportDragging.value = false
+  const file = event.dataTransfer?.files?.[0] ?? null
+  if (file) {
+    setDatabaseImportFile(file)
+  }
+}
+
+function setDatabaseImportFile(file: File) {
+  if (!file.name.toLowerCase().endsWith('.zip')) {
+    notify('请选择 zip 导出包', 'warning')
+    return
+  }
+  databaseImportFile.value = file
+  databaseImportSecondConfirm.value = false
+}
+
+function resetDatabaseImportSelection() {
+  databaseImportFile.value = null
+  databaseImportSecondConfirm.value = false
+  databaseImportDragging.value = false
+  if (databaseImportFileInput.value) {
+    databaseImportFileInput.value.value = ''
+  }
+}
+
+function closeDatabaseImportFileDialog() {
+  databaseImportFileDialog.value = false
+  resetDatabaseImportSelection()
+}
+
+async function confirmDatabaseImport() {
+  const file = selectedDatabaseImportFile()
+  if (!file) {
+    notify('请先选择导入文件', 'warning')
+    return
+  }
+  if (!databaseImportSecondConfirm.value) {
+    databaseImportSecondConfirm.value = true
+    return
+  }
+  databaseImporting.value = true
+  try {
+    const response = await fetch('/api/settings/database/import', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/zip'
+      },
+      body: file
+    })
+    if (!response.ok) {
+      throw new Error(await readError(response))
+    }
+    databaseImportFileDialog.value = false
+    resetDatabaseImportSelection()
+    await loadInitialData()
+    notify('数据库已导入')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '数据库导入失败', 'error')
+  } finally {
+    databaseImporting.value = false
+  }
+}
+
+function databaseExportFilename(disposition: string) {
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded)
+    } catch {
+      return encoded
+    }
+  }
+  return 'musicpilot-database.zip'
+}
+
 function clampInteger(value: number, min: number, max: number, fallback: number) {
   const normalized = Number.isFinite(value) ? Math.trunc(value) : fallback
   return Math.min(Math.max(normalized, min), max)
@@ -5216,6 +5355,29 @@ onUnmounted(() => {
                     </v-btn>
                   </v-card-actions>
                 </v-card>
+
+                <v-card class="settings-card mt-4">
+                  <v-card-title>数据库管理</v-card-title>
+                  <v-card-actions>
+                    <v-btn
+                      color="primary"
+                      prepend-icon="mdi-database-export-outline"
+                      :loading="databaseExporting"
+                      @click="exportDatabase"
+                    >
+                      导出数据库
+                    </v-btn>
+                    <v-spacer />
+                    <v-btn
+                      color="warning"
+                      prepend-icon="mdi-database-import-outline"
+                      :loading="databaseImporting"
+                      @click="openDatabaseImportStartDialog"
+                    >
+                      导入数据库
+                    </v-btn>
+                  </v-card-actions>
+                </v-card>
               </v-window-item>
             </v-window>
           </section>
@@ -5854,6 +6016,68 @@ onUnmounted(() => {
           <v-spacer />
           <v-btn variant="text" :disabled="deleting" @click="deleteDialog = false">取消</v-btn>
           <v-btn color="error" :loading="deleting" @click="confirmDelete">删除</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="databaseImportStartDialog" max-width="460">
+      <v-card title="确认导入数据库">
+        <v-card-text>
+          导入数据库将会清空本地数据，并使用目标数据，是否确认操作？
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="databaseImportStartDialog = false">取消</v-btn>
+          <v-btn color="warning" @click="confirmDatabaseImportStart">确认</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="databaseImportFileDialog" max-width="560">
+      <v-card title="导入数据库">
+        <v-card-text class="dialog-stack">
+          <input
+            ref="databaseImportFileInput"
+            accept=".zip,application/zip"
+            class="hidden-file-input"
+            type="file"
+            @change="handleDatabaseImportFileChange"
+          />
+          <button
+            class="database-import-dropzone"
+            :class="{ 'database-import-dropzone-active': databaseImportDragging }"
+            type="button"
+            @click="openDatabaseImportFilePicker"
+            @dragenter.prevent="databaseImportDragging = true"
+            @dragover.prevent="databaseImportDragging = true"
+            @dragleave.prevent="databaseImportDragging = false"
+            @drop.prevent="handleDatabaseImportDrop"
+          >
+            <v-icon icon="mdi-file-upload-outline" size="36" />
+            <span>{{ selectedDatabaseImportFile()?.name || '拖放数据库导出包到这里' }}</span>
+            <small>点击选择 zip 文件</small>
+          </button>
+          <div v-if="databaseImportSecondConfirm" class="database-import-warning">
+            导入数据库将会清空本地数据，并使用目标数据，是否确认操作？
+          </div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn
+            variant="text"
+            :disabled="databaseImporting"
+            @click="closeDatabaseImportFileDialog"
+          >
+            取消
+          </v-btn>
+          <v-btn
+            color="warning"
+            :disabled="!selectedDatabaseImportFile()"
+            :loading="databaseImporting"
+            @click="confirmDatabaseImport"
+          >
+            {{ databaseImportSecondConfirm ? '确认导入' : '确认' }}
+          </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -7160,6 +7384,49 @@ onUnmounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 16px;
+}
+
+.hidden-file-input {
+  display: none;
+}
+
+.database-import-dropzone {
+  align-items: center;
+  background: rgba(var(--v-theme-primary), 0.04);
+  border: 1px dashed rgba(var(--v-theme-primary), 0.5);
+  border-radius: 8px;
+  color: rgba(var(--v-theme-on-surface), 0.78);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 160px;
+  padding: 24px;
+  text-align: center;
+  width: 100%;
+}
+
+.database-import-dropzone span {
+  font-size: 15px;
+  font-weight: 600;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.database-import-dropzone small {
+  color: rgba(var(--v-theme-on-surface), 0.58);
+  font-size: 13px;
+}
+
+.database-import-dropzone-active {
+  background: rgba(var(--v-theme-primary), 0.1);
+  border-color: rgb(var(--v-theme-primary));
+}
+
+.database-import-warning {
+  color: rgb(var(--v-theme-error));
+  font-weight: 700;
+  line-height: 22px;
 }
 
 .compact-switch {

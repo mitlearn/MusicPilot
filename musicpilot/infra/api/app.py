@@ -22,7 +22,7 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from opencc import OpenCC
@@ -175,6 +175,7 @@ from musicpilot.infra.api.schemas import (
 from musicpilot.infra.auth import issue_session, require_session
 from musicpilot.infra.config import Settings
 from musicpilot.infra.db import Database, SqlAlchemyMediaRepository
+from musicpilot.infra.db.migration import DatabaseMigrationError, DatabaseMigrationService
 from musicpilot.infra.db.models import (
     Artist,
     DownloaderConfig,
@@ -1403,6 +1404,36 @@ def create_app() -> FastAPI:
         await state.reload_notifiers()
         state.add_log("settings", "System settings saved")
         return SystemSettingsResponse(**settings_payload)
+
+    @app.get("/api/settings/database/export")
+    async def export_database() -> Response:
+        exported = await DatabaseMigrationService(state.database).export_zip()
+        filename = f"musicpilot-database-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.zip"
+        return Response(
+            content=exported,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            },
+        )
+
+    @app.post("/api/settings/database/import")
+    async def import_database(request: Request) -> dict[str, Any]:
+        content = await request.body()
+        if not content:
+            raise HTTPException(status_code=422, detail="导入文件不能为空。")
+        await state.task_manager.stop()
+        try:
+            counts = await DatabaseMigrationService(state.database).import_zip(content)
+            await state.reload_indexers()
+            await state.reload_downloader()
+            await state.reload_notifiers()
+            state.add_log("settings", "Database imported")
+        except DatabaseMigrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            state.task_manager.start()
+        return {"status": "ok", "tables": counts}
 
     @app.get("/api/settings/media-servers", response_model=list[MediaServerResponse])
     async def media_servers() -> list[MediaServerResponse]:
