@@ -69,6 +69,7 @@ from musicpilot.core.scraping import (
     LibraryTrackSnapshot,
     LocalMusicScraper,
     ScrapingConfig,
+    ScrapingFileOutcome,
     ScrapingFileResult,
     ScrapingSummary,
     infer_album_context_metadata,
@@ -83,8 +84,8 @@ from musicpilot.core.task_queue import (
     TaskManager,
 )
 from musicpilot.infra.api.schemas import (
-    AddArtistAliasRequest,
     AboutResponse,
+    AddArtistAliasRequest,
     ArtistAliasResponse,
     ArtistBuildStatusResponse,
     ArtistPageResponse,
@@ -231,6 +232,13 @@ PLAYLIST_TRACK_ACTIVE_STATUSES = {
 }
 PLAYLIST_TRACK_SUCCESS_STATUSES = {"existing", "library_refreshed"}
 DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES = {"pending", "metadata_searching"}
+DOWNLOAD_ITEM_SCRAPE_DONE_STATUSES = {"metadata_found", "metadata_not_found", "failed"}
+DOWNLOAD_ITEM_ORGANIZE_ACTIVE_STATUSES = {"organizing"}
+DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES = {
+    "organized",
+    "organize_failed",
+    "organize_skipped",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -496,8 +504,48 @@ class DownloadItemScrapeExecutor:
         if item_id is None:
             raise ValueError("Download item scrape task payload is incomplete.")
         item = await _scrape_download_task_item(self.state, item_id)
+        if item is not None and bool(payload.get("organize_after_scrape")):
+            source_file = _optional_string(payload.get("source_file"))
+            if source_file:
+                record = await self.state.repository.get_download_task(item.torrent_record_id)
+                if record is not None:
+                    await _enqueue_download_item_organize(
+                        self.state,
+                        record,
+                        item,
+                        Path(source_file),
+                    )
         return TaskExecutionResult(
             result={
+                "item_id": item_id,
+                "status": item.status if item is not None else "missing",
+            }
+        )
+
+
+class FileOrganizeExecutor:
+    def __init__(self, state: AppState) -> None:
+        self.state = state
+
+    async def execute(self, task: object) -> TaskExecutionResult:
+        payload = getattr(task, "payload", {}) or {}
+        task_id = _optional_int(payload.get("torrent_record_id"))
+        item_id = _optional_int(payload.get("item_id"))
+        source_file = _optional_string(payload.get("source_file"))
+        task_name = str(payload.get("task_name") or "download")
+        if task_id is None or item_id is None or not source_file:
+            raise ValueError("File organize task payload is incomplete.")
+        item = await _organize_download_task_item(
+            self.state,
+            task_id,
+            item_id,
+            Path(source_file),
+            task_name,
+        )
+        await _finalize_download_refresh_if_ready(self.state, task_id)
+        return TaskExecutionResult(
+            result={
+                "torrent_record_id": task_id,
                 "item_id": item_id,
                 "status": item.status if item is not None else "missing",
             }
@@ -605,6 +653,7 @@ class AppState:
             "DOWNLOAD_ITEM_SCRAPE",
             DownloadItemScrapeExecutor(self),
         )
+        self.task_executors.register("FILE_ORGANIZE", FileOrganizeExecutor(self))
         self.task_executors.register(
             "DOWNLOAD_REFRESH_LIBRARY",
             DownloadRefreshLibraryExecutor(self),
@@ -2157,7 +2206,9 @@ def create_app() -> FastAPI:
                         "task_name": task_name,
                         "source_files": [str(item) for item in source_files],
                     },
-                    resource_keys=["scraper"],
+                    resource_keys=[
+                        _scraping_batch_resource_key("manual-scrape", source_files)
+                    ],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
@@ -2203,7 +2254,9 @@ def create_app() -> FastAPI:
                             str(path) for path in exclude_library_paths
                         ],
                     },
-                    resource_keys=["scraper"],
+                    resource_keys=[
+                        _scraping_batch_resource_key("manual-scrape", (source_path,))
+                    ],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
@@ -2263,7 +2316,9 @@ def create_app() -> FastAPI:
                         },
                         "exclude_library_paths": [str(path) for path in exclude_paths],
                     },
-                    resource_keys=["scraper"],
+                    resource_keys=[
+                        _scraping_batch_resource_key("manual-scrape", source_files)
+                    ],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
@@ -2414,7 +2469,9 @@ def create_app() -> FastAPI:
                             str(path) for path in exclude_library_paths
                         ],
                     },
-                    resource_keys=["scraper"],
+                    resource_keys=[
+                        _scraping_batch_resource_key("manual-scrape", (source_path,))
+                    ],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
@@ -4337,6 +4394,56 @@ async def _schedule_pending_download_task_item_scrapes(
     return scheduled, incomplete
 
 
+async def _schedule_download_item_processing_for_files(
+    state: AppState,
+    task: TorrentRecord,
+    source_files: tuple[Path, ...],
+) -> tuple[int, int, int]:
+    items = await state.repository.list_download_task_items(task.id)
+    matched = _download_items_by_source_file(source_files, items)
+    matched_item_ids = sorted({item.id for item in matched.values()})
+    payload = dict(task.payload or {})
+    if payload.get("organize_item_ids") != matched_item_ids:
+        payload["organize_item_ids"] = matched_item_ids
+        await state.repository.update_download_task(task.id, payload=payload)
+    scheduled = 0
+    pending = 0
+    terminal = 0
+    for source_file in source_files:
+        item = matched.get(source_file)
+        if item is None:
+            continue
+        if item.status in DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES:
+            terminal += 1
+            continue
+        if item.status in DOWNLOAD_ITEM_ORGANIZE_ACTIVE_STATUSES:
+            pending += 1
+            continue
+        if item.status in DOWNLOAD_ITEM_SCRAPE_DONE_STATUSES:
+            organize_task_id = await _enqueue_download_item_organize(
+                state,
+                task,
+                item,
+                source_file,
+            )
+            if organize_task_id is not None:
+                scheduled += 1
+            pending += 1
+            continue
+        scrape_task_id = await _enqueue_download_item_scrape(
+            state,
+            task.id,
+            item.id,
+            organize_after_scrape=True,
+            source_file=source_file,
+            task_name=task.name,
+        )
+        if scrape_task_id is not None:
+            scheduled += 1
+        pending += 1
+    return scheduled, pending, terminal
+
+
 async def _wait_for_download_item_scrapes(
     state: AppState,
     task_id: int,
@@ -4365,6 +4472,10 @@ async def _enqueue_download_item_scrape(
     state: AppState,
     task_id: int,
     item_id: int,
+    *,
+    organize_after_scrape: bool = False,
+    source_file: Path | None = None,
+    task_name: str | None = None,
 ) -> int | None:
     item = await state.repository.get_download_task_item(item_id)
     if item is None or item.torrent_record_id != task_id:
@@ -4387,11 +4498,57 @@ async def _enqueue_download_item_scrape(
             payload={
                 "torrent_record_id": task_id,
                 "item_id": item_id,
+                "organize_after_scrape": organize_after_scrape,
+                "source_file": str(source_file) if source_file is not None else None,
+                "task_name": task_name,
             },
             resource_keys=[f"download-item:{item_id}"],
             max_attempts=3,
             idempotency_key=idempotency_key,
         )
+    )
+
+
+async def _enqueue_download_item_organize(
+    state: AppState,
+    task: TorrentRecord,
+    item: TorrentRecordItem,
+    source_file: Path,
+) -> int | None:
+    idempotency_key = _download_item_organize_idempotency_key(item, source_file)
+    existing = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
+    if existing is not None and existing.status in {"WAIT", "RUNNING", "SUCCEEDED"}:
+        return None
+    return await state.task_manager.enqueue(
+        _download_item_organize_task_create(
+            torrent_record_id=task.id,
+            item_id=item.id,
+            source_file=source_file,
+            task_name=task.name,
+            idempotency_key=idempotency_key,
+        )
+    )
+
+
+def _download_item_organize_task_create(
+    *,
+    torrent_record_id: int,
+    item_id: int,
+    source_file: Path,
+    task_name: str,
+    idempotency_key: str | None = None,
+) -> TaskCreate:
+    return TaskCreate(
+        task_type="FILE_ORGANIZE",
+        payload={
+            "torrent_record_id": torrent_record_id,
+            "item_id": item_id,
+            "source_file": str(source_file),
+            "task_name": task_name,
+        },
+        resource_keys=[_scraping_file_resource_key(source_file)],
+        max_attempts=3,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -4417,6 +4574,23 @@ def _download_item_generation(item: TorrentRecordItem) -> str:
     if isinstance(created_at, datetime):
         return created_at.astimezone(UTC).strftime("%Y%m%d%H%M%S%f")
     return "unknown"
+
+
+def _download_item_organize_idempotency_key(
+    item: TorrentRecordItem,
+    source_file: Path,
+) -> str:
+    identity = "|".join(
+        (
+            str(item.torrent_record_id),
+            str(item.id),
+            item.file_path,
+            str(source_file),
+            _download_item_generation(item),
+        )
+    )
+    digest = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"download-item-organize:{item.torrent_record_id}:{item.id}:{digest}"
 
 
 async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRecordItem | None:
@@ -5806,6 +5980,41 @@ def _normalized_path_key(path: Path) -> str:
     return path.as_posix().lstrip("./")
 
 
+def _scraping_file_resource_key(path: Path) -> str:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:
+        resolved = path.expanduser().absolute()
+    digest = hashlib.sha1(str(resolved).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"scraping-file:{digest}"
+
+
+def _scraping_batch_resource_key(prefix: str, source_files: Iterable[Path]) -> str:
+    identity = "|".join(
+        sorted(str(path.expanduser()) for path in source_files)
+    )
+    digest = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{prefix}:{digest}"
+
+
+def _scraping_file_transfer_runner(
+    state: AppState,
+) -> Callable[[Path, Callable[[], Awaitable[ScrapingFileOutcome]]], Awaitable[ScrapingFileOutcome]]:
+    async def run(
+        source_file: Path,
+        runner: Callable[[], Awaitable[ScrapingFileOutcome]],
+    ) -> ScrapingFileOutcome:
+        return await state.task_manager.run_exclusive(
+            task_type="FILE_ORGANIZE",
+            resource_keys=[_scraping_file_resource_key(source_file)],
+            payload={"source_file": str(source_file)},
+            wait_log_message=f"File organization waiting for file resource: {source_file.name}",
+            runner=runner,
+        )
+
+    return run
+
+
 def _path_matches_any_key(
     path: str | Path | None,
     excluded_keys: set[str],
@@ -5923,12 +6132,13 @@ async def _scrape_manual_source_files(
             forced_metadata=forced_metadata,
             contextual_metadata=contextual_metadata,
             on_file_result=record_file_result,
+            transfer_runner=_scraping_file_transfer_runner(state),
         )
 
     if use_task_manager:
         summary = await state.task_manager.run_exclusive(
             task_type="SCRAPE",
-            resource_keys=["scraper"],
+            resource_keys=[_scraping_batch_resource_key("manual-scrape", source_files)],
             payload={
                 "mode": "manual",
                 "task_name": task_name,
@@ -6017,16 +6227,6 @@ async def _schedule_download_refresh_library(
     state: AppState,
     task: TorrentRecord,
 ) -> None:
-    scheduled, incomplete = await _schedule_pending_download_task_item_scrapes(state, task.id)
-    if incomplete:
-        if scheduled:
-            state.add_log(
-                "metadata",
-                "Download refresh delayed for item metadata scraping: "
-                f"task={task.id}, name={task.name}, incomplete={incomplete}, "
-                f"scheduled={scheduled}",
-            )
-        return
     refresh_task = task
     if task.status != "refreshing_library":
         updated = await state.repository.update_download_task(
@@ -6036,6 +6236,40 @@ async def _schedule_download_refresh_library(
         if updated is not None:
             refresh_task = updated
             await _sync_playlist_tracks_for_download_task(state, updated)
+    try:
+        source_files = await _scraping_source_files_for_task(state, refresh_task)
+    except ScrapingSourceDirectoryNotFound as exc:
+        failed = await state.repository.update_download_task(
+            task.id,
+            status="source_directory_not_found",
+            last_error=str(exc),
+        )
+        if failed is not None:
+            await _sync_playlist_tracks_for_download_task(state, failed)
+        state.add_log(
+            "metadata",
+            f"Scraping source directory not found for {task.name}: {exc}",
+            "WARNING",
+        )
+        return
+    if source_files is None:
+        return
+    scheduled, pending, terminal = await _schedule_download_item_processing_for_files(
+        state,
+        refresh_task,
+        source_files,
+    )
+    if scheduled or pending:
+        state.add_log(
+            "metadata",
+            "Download file processing scheduled: "
+            f"task={task.id}, name={task.name}, files={len(source_files)}, "
+            f"pending={pending}, terminal={terminal}, scheduled={scheduled}",
+        )
+        return
+    if terminal >= len(source_files):
+        await _finalize_download_refresh_if_ready(state, task.id)
+        return
     idempotency_key = f"download-refresh-library:{task.id}"
     existing = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
     if existing is not None:
@@ -6062,7 +6296,7 @@ async def _schedule_download_refresh_library(
                 "torrent_record_id": task.id,
                 "task_name": refresh_task.name,
             },
-            resource_keys=["scraper"],
+            resource_keys=[f"download-refresh:{task.id}"],
             max_attempts=3,
             idempotency_key=idempotency_key,
         )
@@ -6263,12 +6497,13 @@ async def _scrape_download_for_task(
                 library_tracks=library_tracks,
                 media_history=media_history,
                 cached_metadata=cached_metadata,
+                transfer_runner=_scraping_file_transfer_runner(state),
             )
 
         if use_task_manager:
             summary = await state.task_manager.run_exclusive(
                 task_type="SCRAPE",
-                resource_keys=["scraper"],
+                resource_keys=[_scraping_batch_resource_key("download-scrape", source_files)],
                 payload={
                     "mode": "download",
                     "torrent_record_id": task.id,
@@ -6318,6 +6553,230 @@ async def _scrape_download_for_task(
         f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
     )
     return summary
+
+
+async def _organize_download_task_item(
+    state: AppState,
+    task_id: int,
+    item_id: int,
+    source_file: Path,
+    task_name: str,
+) -> TorrentRecordItem | None:
+    task = await state.repository.get_download_task(task_id)
+    item = await state.repository.get_download_task_item(item_id)
+    if task is None or item is None:
+        return item
+    await state.repository.update_download_task_item(
+        item_id,
+        status="organizing",
+        last_error=None,
+    )
+    settings_payload = await state.repository.get_system_settings()
+    config = scraping_config_from_payload(settings_payload)
+    if not config.enabled:
+        return await state.repository.update_download_task_item(
+            item_id,
+            status="organize_failed",
+            last_error="Scraping is disabled.",
+        )
+    source_exists = await asyncio.to_thread(
+        lambda: source_file.exists() and source_file.is_file()
+    )
+    if not source_exists:
+        return await state.repository.update_download_task_item(
+            item_id,
+            status="organize_failed",
+            last_error="Source file is missing.",
+        )
+    library_tracks, media_history = await _scraping_library_snapshots(state)
+    metadata = _track_metadata_from_payload(item.metadata_payload)
+    cached_metadata = {source_file: (metadata,)} if metadata is not None else {}
+
+    async def record_file_result(result: ScrapingFileResult) -> None:
+        if result.status in {"success", "skipped"}:
+            await _ensure_artist_from_metadata(
+                state,
+                result.metadata,
+                context=f"download file organize {task_name}",
+            )
+        await state.repository.record_scraping_result(
+            torrent_hash=task.torrent_hash,
+            source_path=result.source_path,
+            library_path=result.library_path,
+            operation_type=result.operation_type,
+            metadata=result.metadata,
+            status=result.status,
+            error_message=result.error_message,
+        )
+        state.add_log(
+            "metadata",
+            _scraping_file_log_message(task_name, result),
+            "WARNING" if result.status == "failed" else "INFO",
+        )
+
+    try:
+        summary = await state.scraper.process_download(
+            task_name=task_name,
+            save_path=task.save_path,
+            config=config,
+            source_files=(source_file,),
+            library_tracks=library_tracks,
+            media_history=media_history,
+            cached_metadata=cached_metadata,
+            on_file_result=record_file_result,
+            preload_metadata=False,
+            metadata_lookup_completed_files={source_file},
+        )
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "metadata",
+            "Download file organization failed: "
+            f"item_id={item_id}, file={source_file}, error={exc}",
+            "ERROR",
+        )
+        return await state.repository.update_download_task_item(
+            item_id,
+            status="organize_failed",
+            last_error=str(exc) or exc.__class__.__name__,
+        )
+    result = summary.results[0] if summary.results else None
+    if result is None:
+        return await state.repository.update_download_task_item(
+            item_id,
+            status="organize_failed",
+            last_error="No scraping result was produced.",
+        )
+    status = {
+        "success": "organized",
+        "skipped": "organize_skipped",
+        "failed": "organize_failed",
+    }.get(result.status, "organize_failed")
+    return await state.repository.update_download_task_item(
+        item_id,
+        status=status,
+        metadata_title=result.metadata.title,
+        metadata_artist=result.metadata.artist,
+        metadata_album=result.metadata.album,
+        metadata_payload=_track_metadata_payload(result.metadata),
+        last_error=result.error_message if result.status != "success" else None,
+    )
+
+
+async def _scraping_library_snapshots(
+    state: AppState,
+) -> tuple[tuple[LibraryTrackSnapshot, ...], tuple[LibraryTrackSnapshot, ...]]:
+    library_tracks = tuple(
+        LibraryTrackSnapshot(
+            title=item.title,
+            artist=item.artist,
+            album=item.album,
+            size=item.size,
+            path=item.path,
+        )
+        for item in await state.repository.list_music_library_tracks()
+    )
+    media_history = tuple(
+        LibraryTrackSnapshot(
+            title=item.title or "",
+            artist=item.artist,
+            album=item.album,
+            size=media_file_size,
+            path=item.library_path,
+        )
+        for item in await state.repository.list_media_files()
+        if item.title
+        and item.status == "success"
+        and item.library_path
+        and (media_file_size := _file_size_or_none(item.library_path)) is not None
+    )
+    return library_tracks, media_history
+
+
+async def _finalize_download_refresh_if_ready(state: AppState, task_id: int) -> None:
+    await state.task_manager.run_exclusive(
+        task_type="DOWNLOAD_FINALIZE_LIBRARY",
+        resource_keys=[f"download-finalize:{task_id}"],
+        payload={"torrent_record_id": task_id},
+        runner=lambda: _finalize_download_refresh_if_ready_direct(state, task_id),
+    )
+
+
+async def _finalize_download_refresh_if_ready_direct(state: AppState, task_id: int) -> None:
+    task = await state.repository.get_download_task(task_id)
+    if task is None or task.status == "library_refreshed":
+        return
+    items = await state.repository.list_download_task_items(task_id)
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    organize_item_ids = {
+        int(item)
+        for item in payload.get("organize_item_ids", [])
+        if isinstance(item, int)
+    }
+    if organize_item_ids:
+        items = [item for item in items if item.id in organize_item_ids]
+    if not items:
+        return
+    if any(item.status not in DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES for item in items):
+        return
+    organized_count = sum(1 for item in items if item.status == "organized")
+    if organized_count <= 0:
+        state.add_log(
+            "library",
+            f"Library refresh skipped for {task.name}: no files transferred.",
+        )
+        refreshed = await state.repository.update_download_task(
+            task.id,
+            status="library_refreshed",
+            library_refreshed_at=datetime.now(UTC),
+        )
+        if refreshed is not None:
+            await _sync_playlist_tracks_for_download_task(state, refreshed)
+        await _send_event_notifications(state, "library", refreshed or task)
+        return
+    server = await state.repository.default_media_server()
+    if server is None:
+        failed = await state.repository.update_download_task(
+            task.id,
+            status="failed",
+            last_error="No enabled default media server is configured.",
+        )
+        if failed is not None:
+            await _sync_playlist_tracks_for_download_task(state, failed)
+        state.add_log(
+            "library",
+            f"Library refresh failed for {task.name}: no media server",
+            "ERROR",
+        )
+        return
+    try:
+        state.add_log("library", f"Refreshing media library via {server.name}: {task.name}")
+        client = build_media_server_client(server)
+        await client.start_scan()
+    except Exception as exc:  # noqa: BLE001
+        failed = await state.repository.update_download_task(
+            task.id,
+            status="failed",
+            last_error=str(exc),
+        )
+        if failed is not None:
+            await _sync_playlist_tracks_for_download_task(state, failed)
+        state.add_log("library", f"Library refresh failed for {task.name}: {exc}", "ERROR")
+        return
+    refreshed = await state.repository.update_download_task(
+        task.id,
+        status="library_refreshed",
+        library_refreshed_at=datetime.now(UTC),
+    )
+    if refreshed is not None:
+        await _sync_playlist_tracks_for_download_task(state, refreshed)
+    state.add_log("library", f"Media library refresh requested: {task.name}")
+    _fire_sync = asyncio.create_task(
+        _sync_music_library_after_refresh(state),
+        name="musicpilot-music-library-sync-after-refresh",
+    )
+    state._background_tasks.add(_fire_sync)
+    _fire_sync.add_done_callback(state._background_tasks.discard)
+    await _send_event_notifications(state, "library", refreshed or task)
 
 
 async def _scraping_source_files_for_task(
@@ -6413,6 +6872,36 @@ async def _cached_metadata_for_task_source_files(
             item, metadata = same_name[0]
             used_item_ids.add(item.id)
             result[source_file] = (metadata,)
+    return result
+
+
+def _download_items_by_source_file(
+    source_files: tuple[Path, ...],
+    items: list[TorrentRecordItem],
+) -> dict[Path, TorrentRecordItem]:
+    result: dict[Path, TorrentRecordItem] = {}
+    used_item_ids: set[int] = set()
+    for source_file in source_files:
+        for item in items:
+            if item.id in used_item_ids:
+                continue
+            if _source_file_matches_torrent_item(source_file, item):
+                result[source_file] = item
+                used_item_ids.add(item.id)
+                break
+    for source_file in source_files:
+        if source_file in result:
+            continue
+        same_name = [
+            item
+            for item in items
+            if item.id not in used_item_ids
+            and item.file_name.casefold() == source_file.name.casefold()
+        ]
+        if len(same_name) == 1:
+            item = same_name[0]
+            result[source_file] = item
+            used_item_ids.add(item.id)
     return result
 
 

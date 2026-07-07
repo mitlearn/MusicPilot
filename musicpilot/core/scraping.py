@@ -129,6 +129,22 @@ class ScrapingSummary:
     results: tuple[ScrapingFileResult, ...] = ()
 
 
+ScrapingFileOutcome = tuple[ScrapingFileResult, int, int, int]
+LibrarySnapshotLoader = Callable[
+    [],
+    Awaitable[
+        tuple[
+            tuple[LibraryTrackSnapshot, ...],
+            tuple[LibraryTrackSnapshot, ...],
+        ]
+    ],
+]
+TransferRunner = Callable[
+    [Path, Callable[[], Awaitable[ScrapingFileOutcome]]],
+    Awaitable[ScrapingFileOutcome],
+]
+
+
 @dataclass(frozen=True, slots=True)
 class ContextualMetadata:
     metadata: TrackMetadata
@@ -179,6 +195,10 @@ class LocalMusicScraper:
         forced_metadata: dict[Path, TrackMetadata] | None = None,
         contextual_metadata: dict[Path, ContextualMetadata] | None = None,
         on_file_result: Callable[[ScrapingFileResult], Awaitable[None]] | None = None,
+        library_snapshot_loader: LibrarySnapshotLoader | None = None,
+        transfer_runner: TransferRunner | None = None,
+        preload_metadata: bool = True,
+        metadata_lookup_completed_files: set[Path] | None = None,
     ) -> ScrapingSummary:
         if not config.enabled:
             return ScrapingSummary()
@@ -212,18 +232,46 @@ class LocalMusicScraper:
         if audio_files:
             dir_inferred = await asyncio.to_thread(_infer_batch_metadata, audio_files)
 
+        candidate_cache = dict(cached_metadata or {})
+        lookup_completed_paths = set(metadata_lookup_completed_files or set())
+        if preload_metadata:
+            lookup_completed_paths.update(
+                await self._preload_metadata_candidates(
+                    audio_files,
+                    config,
+                    dir_inferred=dir_inferred,
+                    cached_metadata=candidate_cache,
+                    forced_metadata=forced_metadata or {},
+                    contextual_metadata=contextual_metadata or {},
+                )
+            )
+
         for source_file in audio_files:
             try:
-                result, mapped, updated, moved = await self._process_file(
-                    source_file,
-                    config,
-                    library_tracks,
-                    media_history,
-                    dir_inferred=dir_inferred,
-                    cached_candidates=(cached_metadata or {}).get(source_file, ()),
-                    forced_metadata=(forced_metadata or {}).get(source_file),
-                    contextual_metadata=(contextual_metadata or {}).get(source_file),
-                )
+                async def run_file(
+                    source_file: Path = source_file,
+                ) -> ScrapingFileOutcome:
+                    return await self._process_file(
+                        source_file,
+                        config,
+                        library_tracks,
+                        media_history,
+                        dir_inferred=dir_inferred,
+                        cached_candidates=candidate_cache.get(source_file, ()),
+                        forced_metadata=(forced_metadata or {}).get(source_file),
+                        contextual_metadata=(contextual_metadata or {}).get(source_file),
+                        library_snapshot_loader=library_snapshot_loader,
+                        transfer_runner=transfer_runner,
+                        metadata_lookup_completed=source_file in lookup_completed_paths,
+                    )
+
+                if transfer_runner is not None:
+                    result, mapped, updated, moved = await transfer_runner(
+                        source_file,
+                        run_file,
+                    )
+                else:
+                    result, mapped, updated, moved = await run_file()
             except Exception as exc:
                 logger.exception("Scraping file failed unexpectedly: source=%s", source_file)
                 try:
@@ -256,6 +304,136 @@ class LocalMusicScraper:
             results=tuple(results),
         )
 
+    async def _preload_metadata_candidates(
+        self,
+        audio_files: list[Path],
+        config: ScrapingConfig,
+        *,
+        dir_inferred: dict[Path, TrackMetadata],
+        cached_metadata: dict[Path, tuple[TrackMetadata, ...]],
+        forced_metadata: dict[Path, TrackMetadata],
+        contextual_metadata: dict[Path, ContextualMetadata],
+    ) -> set[Path]:
+        if not audio_files:
+            return set()
+        scrape_fields = _metadata_fields_union(
+            config.scrape_when_missing,
+            config.required_metadata,
+        )
+        if not scrape_fields:
+            return set()
+
+        async def preload_file(source_file: Path) -> tuple[Path, tuple[TrackMetadata, ...]] | None:
+            if source_file in forced_metadata:
+                return None
+            if source_file in contextual_metadata:
+                return None
+            try:
+                source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
+                raw_dir_meta = dir_inferred.get(source_file)
+                dir_meta = await self._resolve_known_artist_directory(
+                    source_metadata,
+                    raw_dir_meta,
+                )
+                match_metadata = _metadata_for_matching(
+                    source_metadata,
+                    source_file,
+                    dir_meta=dir_meta,
+                )
+                fallback_metadata = _path_only_metadata_for_matching(
+                    source_file,
+                    raw_dir_meta,
+                )
+                metadata = _merge_metadata(source_metadata, match_metadata)
+                context = contextual_metadata.get(source_file)
+                if context is not None:
+                    metadata = _merge_metadata(metadata, context.metadata)
+                    match_metadata = _merge_metadata(match_metadata, context.metadata)
+                    fallback_metadata = context.metadata
+                    verification_reference = context.metadata
+                    requires_identity_verification = context.verify_identity
+                else:
+                    requires_identity_verification = (
+                        _metadata_requires_identity_verification(
+                            source_metadata,
+                            match_metadata,
+                            metadata,
+                            source_file,
+                            raw_dir_meta,
+                        )
+                    )
+                    verification_reference = _identity_verification_reference(metadata)
+                needs_scrape = bool(_missing_metadata_fields(source_metadata, scrape_fields))
+                if not needs_scrape and not requires_identity_verification:
+                    return None
+                cached_candidates = cached_metadata.get(source_file, ())
+                if requires_identity_verification:
+                    verified = await _select_identity_candidate(
+                        verification_reference,
+                        cached_candidates,
+                        artist_service=self.artist_service,
+                    )
+                    candidates = cached_candidates
+                    if verified is None:
+                        candidates = _merge_metadata_candidates(
+                            candidates,
+                            await self._search_metadata_candidates(
+                                verification_reference,
+                                verification_reference,
+                                (),
+                            ),
+                        )
+                    return source_file, candidates
+                looked_up = await _select_metadata_candidate(
+                    match_metadata,
+                    cached_candidates,
+                    config.required_metadata,
+                    artist_service=self.artist_service,
+                )
+                candidates = cached_candidates
+                if looked_up is None:
+                    online_candidates = await self._search_metadata_candidates(
+                        source_metadata,
+                        match_metadata,
+                        config.required_metadata,
+                    )
+                    candidates = _merge_metadata_candidates(candidates, online_candidates)
+                    looked_up = await _select_metadata_candidate(
+                        match_metadata,
+                        online_candidates,
+                        config.required_metadata,
+                        artist_service=self.artist_service,
+                    )
+                if looked_up is None and not _same_metadata_match_key(
+                    match_metadata,
+                    fallback_metadata,
+                ):
+                    fallback_candidates = await self._search_metadata_candidates(
+                        fallback_metadata,
+                        fallback_metadata,
+                        config.required_metadata,
+                    )
+                    candidates = _merge_metadata_candidates(candidates, fallback_candidates)
+                return source_file, candidates
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Scraping metadata preload failed: source=%s, error=%s",
+                    source_file,
+                    exc,
+                )
+                return None
+
+        completed: set[Path] = set()
+        tasks = [asyncio.create_task(preload_file(source_file)) for source_file in audio_files]
+        for task in asyncio.as_completed(tasks):
+            item = await task
+            if item is None:
+                continue
+            source_file, candidates = item
+            cached_metadata[source_file] = candidates
+            completed.add(source_file)
+        return completed
+
     async def _process_file(
         self,
         source_file: Path,
@@ -266,7 +444,10 @@ class LocalMusicScraper:
         cached_candidates: tuple[TrackMetadata, ...] = (),
         forced_metadata: TrackMetadata | None = None,
         contextual_metadata: ContextualMetadata | None = None,
-    ) -> tuple[ScrapingFileResult, int, int, int]:
+        library_snapshot_loader: LibrarySnapshotLoader | None = None,
+        transfer_runner: TransferRunner | None = None,
+        metadata_lookup_completed: bool = False,
+    ) -> ScrapingFileOutcome:
         working_file = source_file
         mapped_files = 0
         updated_files = 0
@@ -357,7 +538,17 @@ class LocalMusicScraper:
                     0,
                 )
         elif requires_identity_verification:
-            verified, candidates = await self._verify_metadata_identity(verification_reference)
+            if metadata_lookup_completed:
+                candidates = cached_candidates
+                verified = await _select_identity_candidate(
+                    verification_reference,
+                    candidates,
+                    artist_service=self.artist_service,
+                )
+            else:
+                verified, candidates = await self._verify_metadata_identity(
+                    verification_reference
+                )
             candidate_count = len(candidates)
             if verified is None:
                 error_message = await _identity_verification_failure_message(
@@ -450,7 +641,7 @@ class LocalMusicScraper:
                 source_file,
                 _metadata_log_text(looked_up),
             )
-            if looked_up is None:
+            if looked_up is None and not metadata_lookup_completed:
                 online_candidates = await self._search_metadata_candidates(
                     source_metadata,
                     match_metadata,
@@ -470,7 +661,7 @@ class LocalMusicScraper:
                     _metadata_candidates_log_text(online_candidates),
                     _metadata_log_text(looked_up),
                 )
-            if looked_up is None and fallback_available:
+            if looked_up is None and fallback_available and not metadata_lookup_completed:
                 fallback_candidates = await self._search_metadata_candidates(
                     fallback_metadata,
                     fallback_metadata,
@@ -1471,6 +1662,25 @@ def _duplicate_metadata_candidates(
             continue
         seen.add(key)
         candidates.append(metadata)
+    return tuple(candidates)
+
+
+def _merge_metadata_candidates(
+    *candidate_groups: tuple[TrackMetadata, ...],
+) -> tuple[TrackMetadata, ...]:
+    candidates: list[TrackMetadata] = []
+    seen: set[tuple[str, str, str]] = set()
+    for group in candidate_groups:
+        for metadata in group:
+            key = (
+                _normalize_match_text(metadata.title),
+                _normalize_match_text(metadata.artist),
+                _normalize_match_text(metadata.album),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(metadata)
     return tuple(candidates)
 
 
