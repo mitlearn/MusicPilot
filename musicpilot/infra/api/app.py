@@ -4,12 +4,14 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import importlib.metadata
 import json
 import logging
 import os
 import re
 import shutil
 import time
+import tomllib
 import unicodedata
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -82,6 +84,7 @@ from musicpilot.core.task_queue import (
 )
 from musicpilot.infra.api.schemas import (
     AddArtistAliasRequest,
+    AboutResponse,
     ArtistAliasResponse,
     ArtistBuildStatusResponse,
     ArtistPageResponse,
@@ -962,6 +965,17 @@ def create_app() -> FastAPI:
     @app.get("/api/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
         return HealthResponse(app=settings.app_name)
+
+    @app.get("/api/about", response_model=AboutResponse)
+    async def about() -> AboutResponse:
+        return AboutResponse(
+            app=settings.app_name,
+            version=_current_app_version(),
+            repository_name="lzcer/MusicPilot",
+            repository_url="https://github.com/lzcer/MusicPilot",
+            description="用于自动化处理音乐文件的搜索、元数据刮削、整理等流程。灵感来自于MoviePilot。",
+            license="GPL-3.0-only",
+        )
 
     @app.get("/api/dashboard", response_model=DashboardResponse)
     async def dashboard() -> DashboardResponse:
@@ -6809,6 +6823,22 @@ def _proxy_url(settings_payload: dict[str, object]) -> str | None:
     if port:
         return f"http://{auth}{host}:{port}"
     return f"http://{auth}{host}"
+
+
+def _current_app_version() -> str:
+    pyproject_path = Path(__file__).resolve().parents[3] / "pyproject.toml"
+    try:
+        with pyproject_path.open("rb") as file:
+            project = tomllib.load(file).get("project", {})
+    except OSError:
+        project = {}
+    version = project.get("version")
+    if version:
+        return str(version)
+    try:
+        return importlib.metadata.version("musicpilot")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 async def _resolve_proxy_for_site(

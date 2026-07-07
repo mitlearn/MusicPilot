@@ -456,6 +456,15 @@ type SystemSettings = {
   }
 }
 
+type AboutInfo = {
+  app: string
+  version: string
+  repository_name: string
+  repository_url: string
+  description: string
+  license: string
+}
+
 type LogEntry = {
   timestamp: string
   level: string
@@ -664,6 +673,7 @@ const fileDeleting = ref(false)
 const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
 const activeMediaDeleteMode = ref<MediaDeleteMode | null>(null)
 const systemSaving = ref(false)
+const aboutInfo = ref<AboutInfo | null>(null)
 const databaseExporting = ref(false)
 const databaseImporting = ref(false)
 const databaseImportStartDialog = ref(false)
@@ -1246,10 +1256,15 @@ async function loadInitialData() {
     loadDownloaders(),
     loadMediaServers(),
     loadNotifiers(),
-    loadSystemSettings()
+    loadSystemSettings(),
+    loadAboutInfo()
   ])
   syncPagePolling()
   subscribeMetadataSiteSearch()
+}
+
+async function loadAboutInfo() {
+  aboutInfo.value = await api<AboutInfo>('/api/about')
 }
 
 async function loadDashboard() {
@@ -5017,6 +5032,7 @@ onUnmounted(() => {
               <v-tab value="mediaServers">音乐库</v-tab>
               <v-tab value="notifiers">通知</v-tab>
               <v-tab value="system">系统设置</v-tab>
+              <v-tab value="about">关于</v-tab>
             </v-tabs>
 
             <v-window v-model="settingsTab" class="settings-window">
@@ -5377,6 +5393,42 @@ onUnmounted(() => {
                       导入数据库
                     </v-btn>
                   </v-card-actions>
+                </v-card>
+              </v-window-item>
+
+              <v-window-item value="about">
+                <v-card class="settings-card">
+                  <v-card-title>关于</v-card-title>
+                  <v-card-text>
+                    <div class="about-info-list">
+                      <div class="about-info-row">
+                        <span>系统名称</span>
+                        <strong>{{ aboutInfo?.app || 'MusicPilot' }}</strong>
+                      </div>
+                      <div class="about-info-row">
+                        <span>系统版本号</span>
+                        <strong>{{ aboutInfo?.version || '-' }}</strong>
+                      </div>
+                      <div class="about-info-row">
+                        <span>GitHub</span>
+                        <a
+                          :href="aboutInfo?.repository_url || 'https://github.com/lzcer/MusicPilot'"
+                          rel="noreferrer"
+                          target="_blank"
+                        >
+                          {{ aboutInfo?.repository_name || 'lzcer/MusicPilot' }}
+                        </a>
+                      </div>
+                      <div class="about-info-row">
+                        <span>许可证</span>
+                        <strong>{{ aboutInfo?.license || '-' }}</strong>
+                      </div>
+                      <div class="about-info-row about-info-row-block">
+                        <span>项目说明</span>
+                        <p>{{ aboutInfo?.description || '-' }}</p>
+                      </div>
+                    </div>
+                  </v-card-text>
                 </v-card>
               </v-window-item>
             </v-window>
@@ -7384,6 +7436,49 @@ onUnmounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 16px;
+}
+
+.about-info-list {
+  display: grid;
+  gap: 14px;
+  max-width: 720px;
+}
+
+.about-info-row {
+  align-items: center;
+  border-bottom: 1px solid rgba(var(--v-theme-on-surface), 0.08);
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 120px minmax(0, 1fr);
+  padding-bottom: 14px;
+}
+
+.about-info-row span {
+  color: rgba(var(--v-theme-on-surface), 0.62);
+}
+
+.about-info-row a,
+.about-info-row strong,
+.about-info-row p {
+  overflow-wrap: anywhere;
+}
+
+.about-info-row a {
+  color: rgb(var(--v-theme-primary));
+  text-decoration: none;
+}
+
+.about-info-row a:hover {
+  text-decoration: underline;
+}
+
+.about-info-row p {
+  line-height: 22px;
+  margin: 0;
+}
+
+.about-info-row-block {
+  align-items: start;
 }
 
 .hidden-file-input {

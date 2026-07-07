@@ -13,6 +13,15 @@ class HealthResponse(BaseModel):
     app: str
 
 
+class AboutResponse(BaseModel):
+    app: str
+    version: str
+    repository_name: str
+    repository_url: str
+    description: str
+    license: str
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
