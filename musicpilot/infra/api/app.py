@@ -7705,12 +7705,16 @@ def _category_from_logger(name: str) -> str:
         return "download"
     if "processor" in name or "library" in name or "metadata" in name:
         return "transfer"
-    if "notifier" in name or "bot" in name:
+    if name.startswith("aiogram.") or "notifier" in name or "bot" in name:
         return "notify"
     return "system"
 
 
 def _skip_app_log_record(record: logging.LogRecord) -> bool:
     if record.name.startswith(("httpx", "httpcore")) and record.levelno < logging.WARNING:
+        return True
+    if record.name == "aiogram.event" and record.levelno < logging.WARNING:
+        return True
+    if record.name == "aiogram.dispatcher" and record.levelno == logging.WARNING:
         return True
     return False

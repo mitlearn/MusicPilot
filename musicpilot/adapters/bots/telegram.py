@@ -139,14 +139,23 @@ class TelegramBotAdapter:
             query = message.text.strip()
             if not query or query.startswith("/"):
                 return
+            logger.info("Telegram message received: chat=%s, type=text", _chat_log_label(message))
             if query.isdigit() and await self._handle_reply_selection(message, int(query)):
                 return
             await self._start_media_search(message, query)
 
         async def handle_downloading(message: Message) -> None:
+            logger.info(
+                "Telegram command received: chat=%s, command=downloading",
+                _chat_log_label(message),
+            )
             tasks = await self.list_active_downloads()
             if not tasks:
                 await message.answer("<b>当前下载任务</b>\n暂无活跃下载。", parse_mode="HTML")
+                logger.info(
+                    "Telegram command completed: chat=%s, command=downloading, tasks=0",
+                    _chat_log_label(message),
+                )
                 return
             lines = ["<b>当前下载任务</b>"]
             for index, task in enumerate(tasks, start=1):
@@ -161,8 +170,17 @@ class TelegramBotAdapter:
                     )
                 )
             await message.answer("\n".join(lines), parse_mode="HTML")
+            logger.info(
+                "Telegram command completed: chat=%s, command=downloading, tasks=%d",
+                _chat_log_label(message),
+                len(tasks),
+            )
 
         async def handle_info(message: Message) -> None:
+            logger.info(
+                "Telegram command received: chat=%s, command=info",
+                _chat_log_label(message),
+            )
             info = await self.dashboard()
             text = "\n".join(
                 (
@@ -190,6 +208,10 @@ class TelegramBotAdapter:
                 )
             )
             await message.answer(text, parse_mode="HTML")
+            logger.info(
+                "Telegram command completed: chat=%s, command=info",
+                _chat_log_label(message),
+            )
 
         async def handle_callback(callback: CallbackQuery) -> None:
             data = callback.data or ""
@@ -209,6 +231,11 @@ class TelegramBotAdapter:
             except ValueError:
                 await callback.answer("无效的选择。", show_alert=True)
                 return
+            logger.info(
+                "Telegram callback received: chat=%s, action=%s",
+                _chat_log_label(message),
+                parts[1],
+            )
             await callback.answer()
             if parts[1] == "m":
                 await self._change_page(message, session, value, "media")
@@ -218,13 +245,18 @@ class TelegramBotAdapter:
                 await self._select_media(message, session, value)
             elif parts[1] == "d":
                 await self._select_torrent(message, session, value)
+            logger.info(
+                "Telegram callback completed: chat=%s, action=%s",
+                _chat_log_label(message),
+                parts[1],
+            )
 
         self._dispatcher.message.register(handle_downloading, Command("downloading"))
         self._dispatcher.message.register(handle_info, Command("info"))
         self._dispatcher.callback_query.register(handle_callback, F.data.startswith("tg:"))
         self._dispatcher.message.register(handle_text, F.text)
         self._task = asyncio.create_task(
-            self._dispatcher.start_polling(self._bot),
+            self._run_polling(),
             name="musicpilot-telegram-bot",
         )
 
@@ -233,21 +265,27 @@ class TelegramBotAdapter:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+            self._task = None
         if self._bot is not None:
             await self._bot.session.close()
+            self._bot = None
+        self._dispatcher = None
 
     async def send_notification(self, event: NotifyEvent) -> None:
         if self._bot is None:
             return
         text = _telegram_message_text(event)
+        logger.info("Telegram notification sending: recipients=%d", len(self.chat_ids))
         for chat_id in self.chat_ids:
             await self._bot.send_message(chat_id, text, parse_mode="HTML")
+        logger.info("Telegram notification completed: recipients=%d", len(self.chat_ids))
 
     async def notify(self, event: NotifyEvent) -> None:
         await self.send_notification(event)
 
     async def _start_media_search(self, message: Any, query: str) -> None:
         title, artist = _split_query(query)
+        logger.info("Telegram media search started: chat=%s", _chat_log_label(message))
         try:
             candidates = await self.search_media(title, artist)
         except Exception as exc:  # noqa: BLE001
@@ -256,6 +294,10 @@ class TelegramBotAdapter:
             return
         if not candidates:
             await message.answer("没有找到匹配的媒体信息，请调整歌名或歌手后重试。")
+            logger.info(
+                "Telegram media search completed: chat=%s, candidates=0",
+                _chat_log_label(message),
+            )
             return
         response = await message.answer("正在整理媒体搜索结果…")
         session_id = token_urlsafe(6)
@@ -267,6 +309,11 @@ class TelegramBotAdapter:
         )
         self._store_session(session_id, session)
         await self._render_media(response, session_id, session)
+        logger.info(
+            "Telegram media search completed: chat=%s, candidates=%d",
+            _chat_log_label(message),
+            len(candidates),
+        )
 
     async def _handle_reply_selection(self, message: Any, selection: int) -> bool:
         reply = getattr(message, "reply_to_message", None)
@@ -316,6 +363,7 @@ class TelegramBotAdapter:
         selected = session.media[index]
         session.selected_media = selected
         session.stage = "searching_torrents"
+        logger.info("Telegram torrent search started: chat=%s", _chat_log_label(message))
         await message.edit_text("正在搜索可下载的种子…", reply_markup=None)
         try:
             torrents = await self.search_torrents(selected)
@@ -331,12 +379,21 @@ class TelegramBotAdapter:
             session_id = self._session_messages[(session.chat_id, session.message_id)]
             await self._render_media(message, session_id, session)
             await message.answer("没有找到可下载的种子，请选择其他媒体信息。")
+            logger.info(
+                "Telegram torrent search completed: chat=%s, results=0",
+                _chat_log_label(message),
+            )
             return
         session.torrents = torrents
         session.stage = "torrent"
         session.page = 0
         session_id = self._session_messages[(session.chat_id, session.message_id)]
         await self._render_torrents(message, session_id, session)
+        logger.info(
+            "Telegram torrent search completed: chat=%s, results=%d",
+            _chat_log_label(message),
+            len(torrents),
+        )
 
     async def _select_torrent(self, message: Any, session: _Interaction, index: int) -> None:
         if (
@@ -346,6 +403,7 @@ class TelegramBotAdapter:
         ):
             return
         torrent = session.torrents[index]
+        logger.info("Telegram download submission started: chat=%s", _chat_log_label(message))
         await message.edit_text(
             f"正在提交下载：<b>{escape(_short(torrent.title, 240))}</b>",
             parse_mode="HTML",
@@ -365,6 +423,21 @@ class TelegramBotAdapter:
             parse_mode="HTML",
             reply_markup=None,
         )
+        logger.info("Telegram download submission completed: chat=%s", _chat_log_label(message))
+
+    async def _run_polling(self) -> None:
+        logger.info(
+            "Telegram bot polling starting: proxy=%s, recipients=%d",
+            "on" if self.proxy else "off",
+            len(self.chat_ids),
+        )
+        try:
+            await self._dispatcher.start_polling(self._bot)
+        except asyncio.CancelledError:
+            logger.info("Telegram bot polling stopped")
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Telegram bot polling stopped unexpectedly")
 
     async def _render_media(self, message: Any, session_id: str, session: _Interaction) -> None:
         page_items = _page_items(session.media, session.page, self._MEDIA_PAGE_SIZE)
@@ -517,6 +590,14 @@ class TelegramHttpNotifier:
 def _split_query(query: str) -> tuple[str, str | None]:
     title, separator, artist = query.partition(" ")
     return title.strip(), artist.strip() or None if separator else None
+
+
+def _chat_log_label(message: Any) -> str:
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    if chat_id is None:
+        return "-"
+    value = str(chat_id)
+    return f"…{value[-4:]}"
 
 
 def _page_count(total: int, page_size: int) -> int:
