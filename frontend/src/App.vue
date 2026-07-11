@@ -478,7 +478,7 @@ type SystemSettings = {
     required_metadata: Array<'album' | 'artist' | 'lyrics'>
     auto_rename: boolean
     auto_classify: boolean
-    classify_by: 'artist' | 'album'
+    classify_by: 'artist' | 'album' | 'artist_album'
     duplicate_handling: 'ignore' | 'overwrite' | 'keep_largest'
   }
   search: {
@@ -867,7 +867,8 @@ const scrapingRequiredMetadataOptions = [
 
 const scrapingClassifyOptions = [
   { title: '艺术家', value: 'artist' },
-  { title: '专辑', value: 'album' }
+  { title: '专辑', value: 'album' },
+  { title: '艺术家-专辑', value: 'artist_album' }
 ]
 
 const duplicateHandlingOptions = [

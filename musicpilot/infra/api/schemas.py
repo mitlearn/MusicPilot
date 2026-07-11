@@ -649,7 +649,7 @@ class ScrapingSettings(BaseModel):
     required_metadata: list[Literal["album", "artist", "lyrics"]] = Field(default_factory=list)
     auto_rename: bool = False
     auto_classify: bool = False
-    classify_by: Literal["artist", "album"] = "artist"
+    classify_by: Literal["artist", "album", "artist_album"] = "artist"
     duplicate_handling: Literal["ignore", "overwrite", "keep_largest"] = "ignore"
 
 

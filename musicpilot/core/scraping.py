@@ -24,7 +24,7 @@ _t2s = OpenCC("t2s")  # Traditional → Simplified
 
 ScrapingMode = Literal["source", "mapped", "copy"]
 RequiredMetadata = Literal["album", "artist", "lyrics"]
-ClassifyBy = Literal["artist", "album"]
+ClassifyBy = Literal["artist", "album", "artist_album"]
 DuplicateHandling = Literal["ignore", "overwrite", "keep_largest"]
 
 _AUDIO_EXTENSIONS = {
@@ -821,6 +821,7 @@ class LocalMusicScraper:
                     metadata,
                     duplicate,
                     current_size,
+                    config=config,
                     reason="音乐库已存在，重复文件处理为不处理",
                     matched_metadata=duplicate_match.metadata,
                 )
@@ -858,6 +859,7 @@ class LocalMusicScraper:
                         metadata,
                         duplicate,
                         current_size,
+                        config=config,
                         reason=reason,
                         matched_metadata=duplicate_match.metadata,
                     )
@@ -938,6 +940,7 @@ class LocalMusicScraper:
                 metadata,
                 duplicate,
                 current_size,
+                config=config,
                 matched_metadata=duplicate_match.metadata,
             )
         elif overwritten_existing_target:
@@ -1159,7 +1162,13 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
         required_metadata=required_metadata,
         auto_rename=bool(scraping.get("auto_rename")),
         auto_classify=bool(scraping.get("auto_classify")),
-        classify_by="album" if classify_by == "album" else "artist",
+        classify_by=(
+            "artist_album"
+            if classify_by == "artist_album"
+            else "album"
+            if classify_by == "album"
+            else "artist"
+        ),
         duplicate_handling=duplicate_handling,
     )
 
@@ -1573,14 +1582,21 @@ def _classify_or_rename(
 ) -> _PathOperationResult:
     target_dir = path.parent
     if config.auto_classify:
-        group = metadata.artist if config.classify_by == "artist" else metadata.album
-        if group:
+        if config.classify_by == "artist_album":
+            groups = (metadata.artist, metadata.album or "未知专辑")
+        else:
+            groups = (
+                metadata.artist if config.classify_by == "artist" else metadata.album,
+            )
+        if all(groups):
             classify_root = (
                 config.mapped_directory
                 if config.mode in {"mapped", "copy"}
                 else config.source_directory
             )
-            target_dir = (classify_root or path.parent) / _safe_path_part(group)
+            target_dir = classify_root or path.parent
+            for group in groups:
+                target_dir /= _safe_path_part(group)
     target_name = path.name
     if config.auto_rename:
         target_name = f"{_safe_path_part(metadata.title or path.stem)}{path.suffix}"
@@ -1722,10 +1738,16 @@ async def _find_duplicate_media(
     return best
 
 
-def _library_track_path(track: LibraryTrackSnapshot) -> Path | None:
+def _library_track_path(track: LibraryTrackSnapshot, config: ScrapingConfig) -> Path | None:
     if not track.path:
         return None
-    return Path(track.path)
+    path = Path(track.path)
+    candidates = (path,) if path.is_absolute() else tuple(
+        root / path
+        for root in (config.mapped_directory, config.source_directory)
+        if root is not None
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
 def _duplicate_skip_message(
@@ -1733,10 +1755,11 @@ def _duplicate_skip_message(
     track: LibraryTrackSnapshot,
     current_size: int,
     *,
+    config: ScrapingConfig,
     reason: str,
     matched_metadata: TrackMetadata | None = None,
 ) -> str:
-    existing_path = _library_track_path(track)
+    existing_path = _library_track_path(track, config)
     path_text = f"，已存在路径={existing_path}" if existing_path is not None else ""
     match_text = _duplicate_match_metadata_text(metadata, matched_metadata)
     return (
@@ -1754,9 +1777,10 @@ def _duplicate_overwrite_message(
     track: LibraryTrackSnapshot,
     current_size: int,
     *,
+    config: ScrapingConfig,
     matched_metadata: TrackMetadata | None = None,
 ) -> str:
-    existing_path = _library_track_path(track)
+    existing_path = _library_track_path(track, config)
     path_text = f"，原路径={existing_path}" if existing_path is not None else ""
     match_text = _duplicate_match_metadata_text(metadata, matched_metadata)
     return (

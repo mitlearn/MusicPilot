@@ -140,8 +140,8 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | Try scraping when missing | Album, artist, lyrics | Try online completion when these fields are missing. |
 | Fail when missing | Album, artist, lyrics | If these fields are still missing, the organization task is treated as failed. |
 | Auto rename | On / off | Rename files according to metadata. |
-| Auto classify | On / off | Create classification directories by artist or album. |
-| Classify by | Artist, album | Applies when auto classify is enabled. |
+| Auto classify | On / off | Create classification directories by artist, album, or artist-album. |
+| Classify by | Artist, album, artist-album | Applies when auto classify is enabled; artist-album saves files as `Artist/Album/Track`, using `Artist/Unknown Album/Track` when album metadata is missing. |
 | Duplicate handling | Ignore, always overwrite, keep largest file | Decides what happens when the target file already exists. |
 
 Duplicate handling behavior:
