@@ -27,6 +27,45 @@ RequiredMetadata = Literal["album", "artist", "lyrics"]
 ClassifyBy = Literal["artist", "album", "artist_album"]
 DuplicateHandling = Literal["ignore", "overwrite", "keep_largest"]
 
+_INVALID_METADATA_TEXT_KEYS = frozenset(
+    {
+        "unknown",
+        "unknownartist",
+        "unknownalbum",
+        "unknow",
+        "unspecified",
+        "none",
+        "null",
+        "na",
+        "undefined",
+        "未知",
+        "未知歌手",
+        "未知艺术家",
+        "未知专辑",
+        "未分类",
+        "未命名",
+        "无",
+        "kuwo",
+        "kuwomusic",
+        "酷我",
+        "酷我音乐",
+        "kugou",
+        "kugoumusic",
+        "酷狗",
+        "酷狗音乐",
+        "qmusic",
+        "qqmusic",
+        "qq音乐",
+        "netease",
+        "neteasecloudmusic",
+        "网易云",
+        "网易云音乐",
+        "migu",
+        "咪咕",
+        "咪咕音乐",
+    }
+)
+
 _AUDIO_EXTENSIONS = {
     ".aac",
     ".aiff",
@@ -330,7 +369,10 @@ class LocalMusicScraper:
                 return None
             try:
                 source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
-                raw_dir_meta = dir_inferred.get(source_file)
+                raw_dir_meta = await self._resolve_filename_artist_title(
+                    dir_inferred.get(source_file),
+                    source_file,
+                )
                 dir_meta = await self._resolve_known_artist_directory(
                     source_metadata,
                     raw_dir_meta,
@@ -453,7 +495,10 @@ class LocalMusicScraper:
         updated_files = 0
         moved_files = 0
         source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
-        raw_dir_meta = (dir_inferred or {}).get(source_file)
+        raw_dir_meta = await self._resolve_filename_artist_title(
+            (dir_inferred or {}).get(source_file),
+            source_file,
+        )
         dir_meta = await self._resolve_known_artist_directory(source_metadata, raw_dir_meta)
         match_metadata = _metadata_for_matching(source_metadata, source_file, dir_meta=dir_meta)
         fallback_metadata = _path_only_metadata_for_matching(source_file, raw_dir_meta)
@@ -1082,6 +1127,34 @@ class LocalMusicScraper:
                     candidates.append(candidate)
         return tuple(candidates)
 
+    async def _resolve_filename_artist_title(
+        self,
+        dir_meta: TrackMetadata | None,
+        source_file: Path,
+    ) -> TrackMetadata | None:
+        if self.artist_service is None or dir_meta is None:
+            return dir_meta
+        parsed = _parse_artist_title(source_file.stem)
+        if parsed is None:
+            return dir_meta
+        assumed_artist, assumed_title = parsed
+        artist_known, title_known = await asyncio.gather(
+            self.artist_service.has_artist_name(assumed_artist),
+            self.artist_service.has_artist_name(assumed_title),
+        )
+        if artist_known or not title_known:
+            return dir_meta
+        return TrackMetadata(
+            title=assumed_artist,
+            artist=assumed_title,
+            album=dir_meta.album,
+            year=dir_meta.year,
+            track_number=dir_meta.track_number,
+            lyrics=dir_meta.lyrics,
+            cover_url=dir_meta.cover_url,
+            extra=dir_meta.extra,
+        )
+
     async def _resolve_known_artist_directory(
         self,
         source_metadata: TrackMetadata,
@@ -1090,7 +1163,7 @@ class LocalMusicScraper:
         if (
             self.artist_service is None
             or dir_meta is None
-            or source_metadata.artist
+            or _metadata_has_value(source_metadata, "artist")
             or dir_meta.artist
             or not dir_meta.album
         ):
@@ -1100,7 +1173,11 @@ class LocalMusicScraper:
         return TrackMetadata(
             title=dir_meta.title,
             artist=dir_meta.album,
-            album=source_metadata.album,
+            album=(
+                source_metadata.album
+                if _metadata_has_value(source_metadata, "album")
+                else None
+            ),
             year=dir_meta.year,
             track_number=dir_meta.track_number,
             lyrics=dir_meta.lyrics,
@@ -1881,14 +1958,39 @@ def _metadata_for_matching(
     2. Directory structure inference (`dir_meta`)
     3. Filename parsing (`Artist - Title`)
     """
-    if metadata.artist:
-        return metadata
+    if _metadata_has_value(metadata, "artist"):
+        if _metadata_has_value(metadata, "album"):
+            return metadata
+        return TrackMetadata(
+            title=metadata.title,
+            artist=metadata.artist,
+            album=dir_meta.album if dir_meta else None,
+            year=metadata.year,
+            track_number=metadata.track_number,
+            lyrics=metadata.lyrics,
+            cover_url=metadata.cover_url,
+            extra=metadata.extra,
+        )
 
     # Try filename parsing first
     parsed = _parse_artist_title(metadata.title) or _parse_artist_title(source_file.stem)
     if parsed is not None:
         artist, title = parsed
-        album = metadata.album or (dir_meta.album if dir_meta else None)
+        if (
+            dir_meta is not None
+            and dir_meta.artist
+            and dir_meta.title
+            and _normalize_match_text(dir_meta.artist) == _normalize_match_text(title)
+            and _normalize_match_text(dir_meta.title) == _normalize_match_text(artist)
+        ):
+            artist, title = dir_meta.artist, dir_meta.title
+        album = (
+            metadata.album
+            if _metadata_has_value(metadata, "album")
+            else dir_meta.album
+            if dir_meta
+            else None
+        )
         return TrackMetadata(
             title=title,
             artist=artist,
@@ -1907,7 +2009,8 @@ def _metadata_for_matching(
         return TrackMetadata(
             title=inferred_title,
             artist=dir_meta.artist,
-            album=dir_meta.album or metadata.album,
+            album=dir_meta.album
+            or (metadata.album if _metadata_has_value(metadata, "album") else None),
             year=metadata.year,
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
@@ -1957,7 +2060,11 @@ def _metadata_requires_identity_verification(
     reference = _identity_verification_reference(metadata)
     if not reference.title or not reference.artist:
         return False
-    if dir_meta is not None and not source_metadata.artist and match_metadata.artist:
+    if (
+        dir_meta is not None
+        and not _metadata_has_value(source_metadata, "artist")
+        and match_metadata.artist
+    ):
         return True
     if _title_looks_noisy(source_metadata.title):
         return True
@@ -2121,19 +2228,17 @@ def _candidate_fills_required(
     required: tuple[RequiredMetadata, ...],
 ) -> bool:
     for field in required:
-        current = getattr(existing, field)
-        if isinstance(current, str) and current.strip():
+        if _metadata_has_value(existing, field):
             continue
-        value = getattr(candidate, field)
-        if not isinstance(value, str) or not value.strip():
+        if not _metadata_has_value(candidate, field):
             return False
     return True
 
 
 def _candidate_has_conflicting_album(existing: TrackMetadata, candidate: TrackMetadata) -> bool:
     return bool(
-        existing.album
-        and candidate.album
+        _metadata_has_value(existing, "album")
+        and _metadata_has_value(candidate, "album")
         and _match_score(existing.album, candidate.album) == 0
     )
 
@@ -2250,11 +2355,9 @@ def _candidate_missing_required(
 ) -> tuple[RequiredMetadata, ...]:
     missing: list[RequiredMetadata] = []
     for field in required:
-        current = getattr(existing, field)
-        if isinstance(current, str) and current.strip():
+        if _metadata_has_value(existing, field):
             continue
-        value = getattr(candidate, field)
-        if not isinstance(value, str) or not value.strip():
+        if not _metadata_has_value(candidate, field):
             missing.append(field)
     return tuple(missing)
 
@@ -2274,10 +2377,8 @@ async def _metadata_match_score(
     album_score = _match_score(existing.album, scraped.album)
 
     # Strong penalty: existing artist known but candidate artist doesn't match
-    if existing.artist and artist_score == 0:
-        # Check if the existing artist actually had a value, not just blank
-        if existing.artist.strip():
-            artist_score = -3
+    if _metadata_has_value(existing, "artist") and artist_score == 0:
+        artist_score = -3
 
     # Title mismatch means the whole candidate is suspect
     if title_score < 2 and existing.title:
@@ -2443,7 +2544,15 @@ def _filled_metadata_fields(
 
 def _metadata_has_value(metadata: TrackMetadata, field: RequiredMetadata) -> bool:
     value = getattr(metadata, field)
-    return isinstance(value, str) and bool(value.strip())
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if field not in {"artist", "album"}:
+        return True
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    if "\ufffd" in normalized or "锟斤拷" in normalized:
+        return False
+    key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", normalized)
+    return bool(key) and key not in _INVALID_METADATA_TEXT_KEYS
 
 
 def _optional_path(value: object) -> Path | None:
