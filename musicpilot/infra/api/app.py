@@ -5770,6 +5770,7 @@ def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
         id=item.id,
         torrent_hash=torrent_hash,
         name=item.name,
+        size_bytes=_optional_int((item.resource_payload or {}).get("size_bytes")),
         state=item.status,
         progress=item.progress,
         save_path=item.save_path,

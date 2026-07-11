@@ -80,6 +80,7 @@ type DownloadTask = {
   id?: number | null
   torrent_hash?: string | null
   name: string
+  size_bytes?: number | null
   state: string
   progress: number
   save_path?: string | null
@@ -4529,7 +4530,7 @@ onUnmounted(() => {
               />
             </div>
             <v-card>
-              <v-table>
+              <v-table class="download-table">
                 <thead>
                   <tr>
                     <th class="select-cell">
@@ -4540,15 +4541,16 @@ onUnmounted(() => {
                         hide-details
                       />
                     </th>
-                    <th>名称</th>
-                    <th>状态</th>
-                    <th>进度</th>
-                    <th>保存路径</th>
-                    <th>操作</th>
+                    <th class="download-name-cell">名称</th>
+                    <th class="download-size-cell">大小</th>
+                    <th class="download-status-cell">状态</th>
+                    <th class="download-progress-cell">进度</th>
+                    <th class="download-path-cell">保存路径</th>
+                    <th class="download-actions-cell">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!filteredDownloads.length"><td colspan="6" class="empty-cell">{{ downloadEmptyText }}</td></tr>
+                  <tr v-if="!filteredDownloads.length"><td colspan="7" class="empty-cell">{{ downloadEmptyText }}</td></tr>
                   <tr v-for="row in filteredDownloads" :key="row.id || row.torrent_hash || row.name">
                     <td class="select-cell">
                       <v-checkbox
@@ -4559,8 +4561,11 @@ onUnmounted(() => {
                         hide-details
                       />
                     </td>
-                    <td>{{ row.name }}</td>
-                    <td>
+                    <td class="download-name-cell">
+                      <span :title="row.name">{{ row.name }}</span>
+                    </td>
+                    <td class="download-size-cell">{{ formatSize(row.size_bytes) }}</td>
+                    <td class="download-status-cell">
                       <v-chip
                         :color="downloadStatusColor(row.state)"
                         size="small"
@@ -4569,9 +4574,9 @@ onUnmounted(() => {
                         {{ downloadStatusText(row.state) }}
                       </v-chip>
                     </td>
-                    <td><v-progress-linear :model-value="progressPercent(row.progress)" height="8" rounded /></td>
-                    <td class="path-cell">{{ row.save_path || '-' }}</td>
-                    <td class="table-actions">
+                    <td class="download-progress-cell"><v-progress-linear :model-value="progressPercent(row.progress)" height="8" rounded /></td>
+                    <td class="download-path-cell path-cell">{{ row.save_path || '-' }}</td>
+                    <td class="download-actions-cell table-actions">
                       <v-btn
                         icon="mdi-format-list-bulleted"
                         color="primary"

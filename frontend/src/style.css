@@ -118,6 +118,43 @@ body {
   text-overflow: ellipsis;
 }
 
+.download-table table {
+  width: 100%;
+  min-width: 980px;
+  table-layout: fixed;
+}
+
+.download-name-cell {
+  width: 38%;
+}
+
+.download-name-cell > span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.download-size-cell {
+  width: 108px;
+  text-align: right;
+}
+
+.download-status-cell {
+  width: 118px;
+}
+
+.download-progress-cell {
+  width: 120px;
+}
+
+.download-path-cell {
+  width: 160px;
+}
+
+.download-actions-cell {
+  width: 112px;
+}
+
 .action-buttons {
   display: flex;
   align-items: center;

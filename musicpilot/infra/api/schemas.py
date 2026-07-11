@@ -125,6 +125,7 @@ class DownloadTaskResponse(BaseModel):
     id: int | None = None
     torrent_hash: str | None = None
     name: str
+    size_bytes: int | None = None
     state: str
     progress: float
     save_path: str | None = None
