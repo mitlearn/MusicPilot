@@ -860,6 +860,17 @@ const scrapingModeOptions = [
   { title: '复制文件', value: 'copy' }
 ]
 
+const scrapingModeDescription = computed(() => {
+  switch (systemForm.value.scraping.mode) {
+    case 'source':
+      return '直接刮削源文件；补充或写入元数据会修改原文件，可能影响做种。'
+    case 'copy':
+      return '先复制源文件再刮削，源文件不受影响，但会占用两份磁盘空间。'
+    default:
+      return '源文件满足刮削要求时创建映射；若需补充元数据等不满足映射条件，则自动降级为复制后再刮削。'
+  }
+})
+
 const scrapingRequiredMetadataOptions = [
   { title: '专辑', value: 'album' },
   { title: '艺术家', value: 'artist' },
@@ -5617,11 +5628,16 @@ onUnmounted(() => {
                         inset
                         label="开启刮削"
                       />
-                      <v-select
-                        v-model="systemForm.scraping.mode"
-                        :items="scrapingModeOptions"
-                        label="刮削类型"
-                      />
+                      <div class="scraping-mode-field">
+                        <v-select
+                          v-model="systemForm.scraping.mode"
+                          :items="scrapingModeOptions"
+                          label="刮削类型"
+                        />
+                        <div class="scraping-mode-description" aria-live="polite">
+                          {{ scrapingModeDescription }}
+                        </div>
+                      </div>
                       <v-text-field
                         v-model="systemForm.scraping.source_directory"
                         label="源文件目录"
@@ -7996,6 +8012,13 @@ button.dashboard-health-card:hover {
 
 .settings-checks {
   margin: 8px 0 16px;
+}
+
+.scraping-mode-description {
+  color: rgba(var(--v-theme-on-surface), 0.72);
+  font-size: 13px;
+  line-height: 1.5;
+  margin-top: -12px;
 }
 
 .settings-window .card-grid {
