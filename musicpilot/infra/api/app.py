@@ -5473,6 +5473,7 @@ def _track_metadata_response(metadata: TrackMetadata) -> TrackMetadataResponse:
         title=metadata.title,
         artist=metadata.artist,
         album=metadata.album,
+        album_artist=metadata.album_artist,
         year=metadata.year,
         track_number=metadata.track_number,
         lyrics=metadata.lyrics,
@@ -5483,11 +5484,14 @@ def _track_metadata_response(metadata: TrackMetadata) -> TrackMetadataResponse:
     )
 
 
-def _track_metadata_from_manual_payload(payload: MediaManualOrganizeRequest) -> TrackMetadata:
+def _track_metadata_from_manual_payload(
+    payload: MediaManualOrganizeRequest | FileManualOrganizeRequest,
+) -> TrackMetadata:
     return TrackMetadata(
         title=payload.title.strip(),
         artist=_optional_string(payload.artist),
         album=_optional_string(payload.album),
+        album_artist=_optional_string(payload.album_artist),
         year=payload.year,
         track_number=payload.track_number,
         lyrics=_optional_string(payload.lyrics),
@@ -5644,6 +5648,7 @@ def _track_metadata_log_text(metadata: TrackMetadata | None) -> str:
     return (
         "{"
         f"title={metadata.title!r}, artist={metadata.artist!r}, album={metadata.album!r}, "
+        f"album_artist={metadata.album_artist!r}, "
         f"year={metadata.year!r}, track_number={metadata.track_number!r}, "
         f"lyrics={bool(metadata.lyrics)}, cover_url={metadata.cover_url!r}, "
         f"extra_keys={sorted(metadata.extra.keys()) if metadata.extra else []}"
@@ -8078,6 +8083,7 @@ def _track_metadata_from_payload(payload: dict[str, Any] | None) -> TrackMetadat
         title=title,
         artist=_optional_string(payload.get("artist")),
         album=_optional_string(payload.get("album")),
+        album_artist=_optional_string(payload.get("album_artist")),
         year=_optional_int(payload.get("year")),
         track_number=_optional_int(payload.get("track_number")),
         lyrics=_optional_string(payload.get("lyrics")),

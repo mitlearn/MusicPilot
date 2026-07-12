@@ -452,6 +452,7 @@ class ArtistService:
             title=metadata.title,
             artist=metadata.artist,
             album=metadata.album,
+            album_artist=metadata.album_artist,
             year=metadata.year,
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,

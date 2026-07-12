@@ -845,6 +845,7 @@ class LocalMusicScraper:
                     title=metadata.title,
                     artist=canonical,
                     album=metadata.album,
+                    album_artist=metadata.album_artist,
                     year=metadata.year,
                     track_number=metadata.track_number,
                     lyrics=metadata.lyrics,
@@ -1148,6 +1149,7 @@ class LocalMusicScraper:
             title=assumed_artist,
             artist=assumed_title,
             album=dir_meta.album,
+            album_artist=dir_meta.album_artist,
             year=dir_meta.year,
             track_number=dir_meta.track_number,
             lyrics=dir_meta.lyrics,
@@ -1178,6 +1180,7 @@ class LocalMusicScraper:
                 if _metadata_has_value(source_metadata, "album")
                 else None
             ),
+            album_artist=dir_meta.album_artist,
             year=dir_meta.year,
             track_number=dir_meta.track_number,
             lyrics=dir_meta.lyrics,
@@ -1257,6 +1260,7 @@ def read_track_metadata(path: Path) -> TrackMetadata:
     title = path.stem
     artist = None
     album = None
+    album_artist = None
     year = None
     track_number = None
     lyrics = None
@@ -1264,6 +1268,7 @@ def read_track_metadata(path: Path) -> TrackMetadata:
         title = _first_tag(audio.tags.get("title")) or title
         artist = _first_tag(audio.tags.get("artist"))
         album = _first_tag(audio.tags.get("album"))
+        album_artist = _first_tag(audio.tags.get("albumartist"))
         year = _parse_year(_first_tag(audio.tags.get("date")))
         track_number = _parse_track_number(_first_tag(audio.tags.get("tracknumber")))
         lyrics = _first_tag(audio.tags.get("lyrics"))
@@ -1271,6 +1276,7 @@ def read_track_metadata(path: Path) -> TrackMetadata:
         title=title,
         artist=artist,
         album=album,
+        album_artist=album_artist,
         year=year,
         track_number=track_number,
         lyrics=lyrics,
@@ -1659,11 +1665,16 @@ def _classify_or_rename(
 ) -> _PathOperationResult:
     target_dir = path.parent
     if config.auto_classify:
+        primary_artist = _primary_artist(metadata.artist)
+        groups: tuple[str | None, ...]
         if config.classify_by == "artist_album":
-            groups = (metadata.artist, metadata.album or "未知专辑")
+            groups = (
+                metadata.album_artist or primary_artist,
+                metadata.album or "未知专辑",
+            )
         else:
             groups = (
-                metadata.artist if config.classify_by == "artist" else metadata.album,
+                primary_artist if config.classify_by == "artist" else metadata.album,
             )
         if all(groups):
             classify_root = (
@@ -1673,7 +1684,8 @@ def _classify_or_rename(
             )
             target_dir = classify_root or path.parent
             for group in groups:
-                target_dir /= _safe_path_part(group)
+                if group is not None:
+                    target_dir /= _safe_path_part(group)
     target_name = path.name
     if config.auto_rename:
         target_name = f"{_safe_path_part(metadata.title or path.stem)}{path.suffix}"
@@ -1965,6 +1977,7 @@ def _metadata_for_matching(
             title=metadata.title,
             artist=metadata.artist,
             album=dir_meta.album if dir_meta else None,
+            album_artist=metadata.album_artist,
             year=metadata.year,
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
@@ -1995,6 +2008,7 @@ def _metadata_for_matching(
             title=title,
             artist=artist,
             album=album,
+            album_artist=metadata.album_artist or (dir_meta.album_artist if dir_meta else None),
             year=metadata.year,
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
@@ -2011,6 +2025,7 @@ def _metadata_for_matching(
             artist=dir_meta.artist,
             album=dir_meta.album
             or (metadata.album if _metadata_has_value(metadata, "album") else None),
+            album_artist=metadata.album_artist or dir_meta.album_artist,
             year=metadata.year,
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
@@ -2092,6 +2107,7 @@ def _identity_verification_reference(metadata: TrackMetadata) -> TrackMetadata:
         title=title or metadata.title,
         artist=artist,
         album=metadata.album,
+        album_artist=metadata.album_artist,
         year=metadata.year,
         track_number=metadata.track_number,
         lyrics=metadata.lyrics,
@@ -2459,6 +2475,11 @@ def _split_artist_names(value: str) -> list[str]:
     return split_artist_credit(value)
 
 
+def _primary_artist(value: str | None) -> str | None:
+    artists = split_artist_credit(value)
+    return artists[0] if artists else None
+
+
 def normalize_metadata_match_text(value: str | None) -> str:
     if not value:
         return ""
@@ -2478,6 +2499,7 @@ def _merge_metadata(existing: TrackMetadata, scraped: TrackMetadata) -> TrackMet
         title=scraped.title or existing.title,
         artist=scraped.artist or existing.artist,
         album=scraped.album or existing.album,
+        album_artist=scraped.album_artist or existing.album_artist,
         year=scraped.year or existing.year,
         track_number=scraped.track_number or existing.track_number,
         lyrics=scraped.lyrics or existing.lyrics,
@@ -2504,6 +2526,7 @@ def _merge_missing_metadata(
         title=existing.title,
         artist=artist,
         album=album,
+        album_artist=existing.album_artist or scraped.album_artist,
         year=existing.year or scraped.year,
         track_number=existing.track_number,
         lyrics=scraped.lyrics if "lyrics" in missing_fields and scraped.lyrics else existing.lyrics,

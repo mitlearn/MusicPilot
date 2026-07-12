@@ -281,6 +281,7 @@ class FileManualOrganizeRequest(BaseModel):
     title: str = Field(min_length=1)
     artist: str | None = None
     album: str | None = None
+    album_artist: str | None = None
     year: int | None = None
     track_number: int | None = None
     lyrics: str | None = None
@@ -349,6 +350,7 @@ class TrackMetadataResponse(BaseModel):
     title: str
     artist: str | None = None
     album: str | None = None
+    album_artist: str | None = None
     year: int | None = None
     track_number: int | None = None
     lyrics: str | None = None
@@ -368,6 +370,7 @@ class MediaManualOrganizeRequest(BaseModel):
     title: str = Field(min_length=1)
     artist: str | None = None
     album: str | None = None
+    album_artist: str | None = None
     year: int | None = None
     track_number: int | None = None
     lyrics: str | None = None

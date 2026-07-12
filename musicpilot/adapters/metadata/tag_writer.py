@@ -35,6 +35,7 @@ def _write_tags_sync(
     _set_tag(audio, "title", metadata.title)
     _set_tag(audio, "artist", metadata.artist, split_commas=True)
     _set_tag(audio, "album", metadata.album)
+    _set_tag(audio, "albumartist", metadata.album_artist)
     year = str(metadata.year) if metadata.year is not None else None
     _set_tag(audio, "date", year)
     _set_tag(audio, "year", year)

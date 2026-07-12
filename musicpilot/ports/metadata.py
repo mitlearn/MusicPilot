@@ -9,6 +9,7 @@ class TrackMetadata:
     title: str
     artist: str | None = None
     album: str | None = None
+    album_artist: str | None = None
     year: int | None = None
     track_number: int | None = None
     lyrics: str | None = None
