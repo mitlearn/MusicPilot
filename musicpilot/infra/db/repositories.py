@@ -5,6 +5,7 @@ import os
 import re
 import time
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1859,6 +1860,22 @@ class SqlAlchemyMediaRepository:
                 )
             )
             return list(result.scalars().all())
+
+    async def delete_music_library_tracks(self, track_ids: Iterable[int]) -> int:
+        ids = tuple(dict.fromkeys(track_ids))
+        if not ids:
+            return 0
+        async with self.database.session() as session:
+            await session.execute(
+                update(PlaylistTrack)
+                .where(PlaylistTrack.matched_library_track_id.in_(ids))
+                .values(matched_library_track_id=None)
+            )
+            result = await session.execute(
+                delete(MusicLibraryTrack).where(MusicLibraryTrack.id.in_(ids))
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
 
     async def list_music_library_tracks_page(
         self,

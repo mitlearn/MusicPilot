@@ -6264,6 +6264,42 @@ async def _sync_music_library_after_refresh(state: AppState) -> None:
         state.add_log("library", f"Music library sync after refresh failed: {exc}", "ERROR")
 
 
+async def _refresh_music_library_after_manual_reorganize(
+    state: AppState,
+    task_name: str,
+) -> None:
+    server = await state.repository.default_media_server()
+    if server is None:
+        state.add_log(
+            "library",
+            f"Music library refresh after manual reorganization skipped: "
+            f"no media server, task={task_name}",
+            "WARNING",
+        )
+        return
+    try:
+        client = build_media_server_client(server)
+        await client.start_scan()
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "library",
+            f"Music library refresh after manual reorganization failed: "
+            f"task={task_name}, error={exc}",
+            "ERROR",
+        )
+        return
+    state.add_log(
+        "library",
+        f"Media library refresh requested after manual reorganization: {task_name}",
+    )
+    sync_task = asyncio.create_task(
+        _sync_music_library_after_refresh(state),
+        name="musicpilot-music-library-sync-after-manual-reorganization",
+    )
+    state._background_tasks.add(sync_task)
+    sync_task.add_done_callback(state._background_tasks.discard)
+
+
 async def _sync_music_library_from_media_server(state: AppState) -> int:
     server = await state.repository.default_media_server()
     if server is None:
@@ -6403,9 +6439,25 @@ async def _prepare_media_record_reorganize(
     config: ScrapingConfig,
 ) -> tuple[Path, ...]:
     exclude_paths: list[Path] = []
+    old_file_size: int | None = None
     if media.library_path:
         library_paths = _media_library_path_candidates(media.library_path, config)
         exclude_paths.extend(library_paths)
+        old_file_size = next(
+            (
+                size
+                for library_path in library_paths
+                if (size := _file_size_or_none(str(library_path))) is not None
+            ),
+            None,
+        )
+        await _delete_reorganized_music_library_tracks(
+            state,
+            media,
+            library_paths,
+            old_file_size,
+            config,
+        )
         for library_path in library_paths:
             if media.status != "success":
                 continue
@@ -6420,11 +6472,82 @@ async def _prepare_media_record_reorganize(
     elif media.error_message:
         legacy_paths = _media_existing_path_candidates(media.error_message, config)
         exclude_paths.extend(legacy_paths)
+        old_file_size = next(
+            (
+                size
+                for legacy_path in legacy_paths
+                if (size := _file_size_or_none(str(legacy_path))) is not None
+            ),
+            None,
+        )
+        await _delete_reorganized_music_library_tracks(
+            state,
+            media,
+            legacy_paths,
+            old_file_size,
+            config,
+        )
         for legacy_path in legacy_paths:
             await _delete_file_path(legacy_path)
             break
     await state.repository.delete_media_file(media.id)
     return tuple(exclude_paths)
+
+
+async def _delete_reorganized_music_library_tracks(
+    state: AppState,
+    media: MediaFile,
+    library_paths: tuple[Path, ...],
+    old_file_size: int | None,
+    config: ScrapingConfig,
+) -> None:
+    tracks = await state.repository.list_music_library_tracks()
+    library_roots = tuple(
+        path for path in (config.mapped_directory, config.source_directory) if path is not None
+    )
+    path_keys = {
+        key for path in library_paths for key in _path_match_keys(path, library_roots)
+    }
+    matched = [
+        track
+        for track in tracks
+        if _path_matches_any_key(track.path, path_keys, library_roots)
+    ]
+    if not matched:
+        identity = (
+            normalize_metadata_match_text(media.title or ""),
+            normalize_metadata_match_text(media.artist or ""),
+            normalize_metadata_match_text(media.album or ""),
+        )
+        if all(identity) and old_file_size is not None:
+            candidates = [
+                track
+                for track in tracks
+                if (
+                    normalize_metadata_match_text(track.title),
+                    normalize_metadata_match_text(track.artist or ""),
+                    normalize_metadata_match_text(track.album or ""),
+                )
+                == identity
+                and track.size == old_file_size
+            ]
+            if len(candidates) == 1:
+                matched = candidates
+            elif len(candidates) > 1:
+                state.add_log(
+                    "library",
+                    "Music library cleanup skipped ambiguous metadata match: "
+                    f"media_id={media.id}, candidates={len(candidates)}",
+                    "WARNING",
+                )
+    if not matched:
+        return
+    deleted = await state.repository.delete_music_library_tracks(track.id for track in matched)
+    state.add_log(
+        "library",
+        f"Removed stale music library track(s) before reorganization: "
+        f"media_id={media.id}, deleted={deleted}",
+    )
 
 
 def _media_existing_path_candidates(message: str, config: ScrapingConfig) -> tuple[Path, ...]:
@@ -6750,14 +6873,15 @@ async def _scrape_manual_source_files(
     exclude_library_paths: tuple[Path, ...] = (),
     use_task_manager: bool = True,
 ) -> ScrapingSummary:
-    try:
-        await _sync_music_library_from_media_server(state)
-    except Exception as exc:  # noqa: BLE001
-        state.add_log(
-            "library",
-            f"Music library sync before manual scraping failed: {exc}",
-            "WARNING",
-        )
+    if not exclude_library_paths:
+        try:
+            await _sync_music_library_from_media_server(state)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "library",
+                f"Music library sync before manual scraping failed: {exc}",
+                "WARNING",
+            )
     library_roots = tuple(
         path for path in (config.mapped_directory, config.source_directory) if path is not None
     )
@@ -6858,6 +6982,8 @@ async def _scrape_manual_source_files(
         f"failed={summary.failed_files}, "
         f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
     )
+    if exclude_library_paths and any(item.status == "success" for item in summary.results):
+        await _refresh_music_library_after_manual_reorganize(state, task_name)
     return summary
 
 
