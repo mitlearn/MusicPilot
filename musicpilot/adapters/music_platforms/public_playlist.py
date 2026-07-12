@@ -9,8 +9,8 @@ import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
-from urllib.parse import parse_qs, urlparse, urlunparse
+from typing import Any, cast
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -32,6 +32,7 @@ NETEASE_MUSIC_HOSTS = {
 KUWO_MUSIC_HOSTS = {"kuwo.cn", "www.kuwo.cn", "m.kuwo.cn", "mobile.kuwo.cn"}
 KUGOU_MUSIC_HOSTS = {"www.kugou.com", "m.kugou.com", "kugou.com", "h5.kugou.com"}
 SPOTIFY_MUSIC_HOSTS = {"open.spotify.com", "spotify.link", "play.spotify.com", "spotify.com"}
+APPLE_MUSIC_HOSTS = {"music.apple.com"}
 
 
 @dataclass
@@ -71,6 +72,8 @@ class PublicPlaylistImporter:
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
         self._owns_client = client is None
+        self._apple_token: str | None = None
+        self._apple_token_expires_at = 0
 
     async def close(self) -> None:
         if self._owns_client:
@@ -83,8 +86,21 @@ class PublicPlaylistImporter:
                 follow_redirects=True,
                 proxy=proxy_url,
             ) as client:
-                return await PublicPlaylistImporter(client).parse(playlist_url)
-        url = await self._resolve_url(playlist_url)
+                importer = PublicPlaylistImporter(client)
+                importer._apple_token = self._apple_token
+                importer._apple_token_expires_at = self._apple_token_expires_at
+                try:
+                    return await importer.parse(playlist_url)
+                finally:
+                    self._apple_token = importer._apple_token
+                    self._apple_token_expires_at = importer._apple_token_expires_at
+        original_url = playlist_url.strip()
+        if _host_matches(_hostname(original_url), APPLE_MUSIC_HOSTS) and "/playlist/" in urlparse(
+            original_url
+        ).path:
+            url = original_url
+        else:
+            url = await self._resolve_url(original_url)
         url = _preserve_original_fragment(url, playlist_url)
         hostname = _hostname(url)
         if _host_matches(hostname, QQ_MUSIC_HOSTS):
@@ -97,6 +113,8 @@ class PublicPlaylistImporter:
             return await self._parse_kugou(url)
         if _host_matches(hostname, SPOTIFY_MUSIC_HOSTS):
             return await self._parse_spotify(url)
+        if _host_matches(hostname, APPLE_MUSIC_HOSTS):
+            return await self._parse_apple_music(url)
         raise UnsupportedPublicPlaylistURL("暂不支持该歌单链接。")
 
     async def _resolve_url(self, playlist_url: str) -> str:
@@ -377,6 +395,127 @@ class PublicPlaylistImporter:
             raw_payload=first_payload,
             tracks=[track for track in parsed_tracks if track is not None],
         )
+
+    async def _parse_apple_music(self, playlist_url: str) -> PublicPlaylist:
+        parsed = urlparse(playlist_url)
+        path_parts = [part for part in parsed.path.split("/") if part]
+        try:
+            playlist_part = path_parts.index("playlist")
+        except ValueError as exc:
+            raise UnsupportedPublicPlaylistURL("该 Apple Music 链接不是歌单分享链接。") from exc
+        storefront = path_parts[0].lower() if path_parts else ""
+        playlist_id = _optional_string(path_parts[-1])
+        if (
+            not re.fullmatch(r"[a-z]{2}", storefront)
+            or playlist_part + 2 >= len(path_parts)
+            or not playlist_id
+        ):
+            raise PublicPlaylistParseError("无法识别 Apple Music 歌单地区或 ID。")
+
+        token = await self._apple_music_developer_token()
+        headers = _apple_music_headers(token)
+        response = await self._client.get(
+            f"https://amp-api.music.apple.com/v1/catalog/{storefront}/playlists/{playlist_id}",
+            headers=headers,
+            params={"include": "tracks", "limit[tracks]": 100},
+        )
+        if response.status_code == 401:
+            token = await self._apple_music_developer_token(force_refresh=True)
+            headers = _apple_music_headers(token)
+            response = await self._client.get(
+                f"https://amp-api.music.apple.com/v1/catalog/{storefront}/playlists/{playlist_id}",
+                headers=headers,
+                params={"include": "tracks", "limit[tracks]": 100},
+            )
+        if response.status_code in {401, 403, 404}:
+            raise PublicPlaylistParseError(
+                "无法访问该 Apple Music 歌单，请确认分享链接可在浏览器中直接打开。"
+            )
+        response.raise_for_status()
+        payload = response.json()
+        playlist_data = _safe_get(payload, ["data", 0], {}) or {}
+        if not isinstance(playlist_data, dict):
+            raise PublicPlaylistParseError("Apple Music 未返回有效的歌单信息。")
+        attributes_value = playlist_data.get("attributes")
+        attributes = (
+            cast(dict[str, Any], attributes_value) if isinstance(attributes_value, dict) else {}
+        )
+        tracks_relationship = _safe_get(playlist_data, ["relationships", "tracks"], {}) or {}
+        raw_tracks = (
+            list(tracks_relationship.get("data") or [])
+            if isinstance(tracks_relationship, dict)
+            else []
+        )
+        next_url = (
+            _optional_string(tracks_relationship.get("next"))
+            if isinstance(tracks_relationship, dict)
+            else None
+        )
+        visited_pages: set[str] = set()
+        while next_url and next_url not in visited_pages:
+            visited_pages.add(next_url)
+            page_response = await self._client.get(
+                urljoin("https://amp-api.music.apple.com", next_url),
+                headers=headers,
+            )
+            page_response.raise_for_status()
+            page_payload = page_response.json()
+            page_tracks = page_payload.get("data") if isinstance(page_payload, dict) else []
+            if isinstance(page_tracks, list):
+                raw_tracks.extend(page_tracks)
+            next_url = (
+                _optional_string(page_payload.get("next"))
+                if isinstance(page_payload, dict)
+                else None
+            )
+        tracks = [
+            _apple_music_track(track, index)
+            for index, track in enumerate(raw_tracks, start=1)
+            if isinstance(track, dict)
+        ]
+        return PublicPlaylist(
+            platform="apple_music",
+            external_id=playlist_id,
+            name=_optional_string(attributes.get("name")) or f"playlist-{playlist_id}",
+            source_url=playlist_url,
+            owner_name=_optional_string(attributes.get("curatorName")),
+            description=_apple_music_description(attributes.get("description")),
+            cover_url=_apple_music_artwork_url(attributes.get("artwork")),
+            raw_payload=payload,
+            tracks=[track for track in tracks if track is not None],
+        )
+
+    async def _apple_music_developer_token(self, *, force_refresh: bool = False) -> str:
+        if (
+            not force_refresh
+            and self._apple_token
+            and self._apple_token_expires_at > int(time.time()) + 300
+        ):
+            return self._apple_token
+        response = await self._client.get(
+            "https://music.apple.com",
+            params={"l": "en-US"},
+            headers={"User-Agent": _browser_user_agent()},
+        )
+        response.raise_for_status()
+        asset_match = re.search(r'/(assets/index[~-][^/" ]+\.js)', response.text)
+        if not asset_match:
+            raise PublicPlaylistParseError("无法定位 Apple Music Web 入口脚本。")
+        script_response = await self._client.get(
+            f"https://music.apple.com/{asset_match.group(1)}",
+            headers={"User-Agent": _browser_user_agent()},
+        )
+        script_response.raise_for_status()
+        token_match = re.search(
+            r'(eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)',
+            script_response.text,
+        )
+        if not token_match:
+            raise PublicPlaylistParseError("无法获取 Apple Music Web developer token。")
+        token = token_match.group(1)
+        self._apple_token = token
+        self._apple_token_expires_at = _jwt_expiration(token) or int(time.time()) + 900
+        return token
 
     async def _spotify_session_data(self) -> dict[str, str]:
         headers = _spotify_common_headers()
@@ -708,14 +847,78 @@ def _spotify_track(item: dict[str, Any], position: int) -> PublicPlaylistTrack |
     )
 
 
+def _apple_music_track(
+    item: dict[str, Any], position: int
+) -> PublicPlaylistTrack | None:
+    attributes_value = item.get("attributes")
+    attributes = (
+        cast(dict[str, Any], attributes_value) if isinstance(attributes_value, dict) else {}
+    )
+    external_id = _optional_string(
+        item.get("id") or _safe_get(attributes, ["playParams", "catalogId"], None)
+    )
+    title = _optional_string(attributes.get("name"))
+    if not external_id or not title:
+        return None
+    return PublicPlaylistTrack(
+        external_id=external_id,
+        position=position,
+        title=title,
+        artist=_optional_string(attributes.get("artistName")),
+        album=_optional_string(attributes.get("albumName")),
+        duration=_millis_to_seconds(attributes.get("durationInMillis")),
+        cover_url=_apple_music_artwork_url(attributes.get("artwork")),
+        raw_payload=item,
+    )
+
+
+def _apple_music_description(value: object) -> str | None:
+    if isinstance(value, dict):
+        return _optional_string(value.get("standard") or value.get("short"))
+    return _optional_string(value)
+
+
+def _apple_music_artwork_url(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    url = _optional_string(value.get("url"))
+    if not url:
+        return None
+    return url.replace("{w}", "800").replace("{h}", "800").replace("{f}", "jpg")
+
+
+def _apple_music_headers(token: str) -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Origin": "https://music.apple.com",
+        "Referer": "https://music.apple.com/",
+        "User-Agent": _browser_user_agent(),
+    }
+
+
+def _browser_user_agent() -> str:
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    )
+
+
+def _jwt_expiration(token: str) -> int | None:
+    try:
+        payload = token.split(".")[1]
+        padding = "=" * (-len(payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload + padding))
+        return _optional_int(decoded.get("exp")) if isinstance(decoded, dict) else None
+    except (IndexError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _spotify_common_headers() -> dict[str, str]:
     browser_version = "145"
     return {
         "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{browser_version}.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": _browser_user_agent(),
         "Sec-Ch-Ua": (
             f'"Chromium";v="{browser_version}", "Not(A:Brand";v="24", '
             f'"Google Chrome";v="{browser_version}"'

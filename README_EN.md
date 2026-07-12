@@ -106,7 +106,7 @@ The file management page is used to browse source files or target music library 
 
 ### 5.5. Playlist Management
 
-The playlists page shows the local state of imported external playlists, including source platform, track count, existing tracks, pending tracks, submitted tasks, failures, and sync status. The action area provides entry points for details, match refresh, download submission, sync, and deletion.
+The playlists page shows the local state of imported external playlists, including source platform, track count, existing tracks, pending tracks, submitted tasks, failures, and sync status. Public playlists from QQ Music, NetEase Cloud Music, Kuwo Music, Kugou Music, Spotify, and Apple Music can be imported from shared links. The action area provides entry points for details, match refresh, download submission, sync, and deletion.
 
 ![MusicPilot playlists](docs/assets/screenshots/playlists.png)
 

@@ -3880,7 +3880,8 @@ function playlistPlatformLabel(platform: string) {
     qq: 'QQ音乐',
     netease: '网易云音乐',
     kuwo: '酷我音乐',
-    kugou: '酷狗音乐'
+    kugou: '酷狗音乐',
+    apple_music: 'Apple Music'
   }[platform] ?? platform
 }
 
@@ -6167,7 +6168,7 @@ onUnmounted(() => {
                   <div class="font-weight-medium">{{ playlist.name }}</div>
                   <div class="muted-text">{{ playlist.owner_name || '-' }}</div>
                 </td>
-                <td>{{ playlist.platform || '-' }}</td>
+                <td>{{ playlist.platform ? playlistPlatformLabel(playlist.platform) : '-' }}</td>
                 <td>{{ playlist.track_count }}</td>
               </tr>
             </tbody>
