@@ -42,12 +42,12 @@ from musicpilot.adapters.bots import (
     TelegramPlaylistSyncSummary,
 )
 from musicpilot.adapters.downloaders import QBittorrentClient, TransmissionClient
-from musicpilot.adapters.indexers import build_nexusphp_indexers, load_merged_parser_catalog
-from musicpilot.adapters.indexers.nexusphp import (
-    NexusPHPCrawler,
-    NexusPHPParserConfig,
-    NexusPHPSiteConfig,
+from musicpilot.adapters.indexers import (
+    ParserCatalogEntry,
+    build_indexers,
+    load_merged_parser_catalog,
 )
+from musicpilot.adapters.indexers.nexusphp import NexusPHPParserConfig
 from musicpilot.adapters.media_servers import build_media_server_client
 from musicpilot.adapters.metadata import (
     MultiSourceMusicProvider,
@@ -929,7 +929,7 @@ class AppState:
         sites = [_site_payload(site) for site in await self.repository.list_indexer_sites()]
         system_settings = await self.repository.get_system_settings()
         proxy_url = _proxy_url(system_settings)
-        self.indexers = build_nexusphp_indexers(
+        self.indexers = build_indexers(
             sites,
             self.parser_catalog,
             proxy_url=proxy_url,
@@ -1893,40 +1893,41 @@ def create_app() -> FastAPI:
     @app.get("/api/sites", response_model=list[SiteResponse])
     async def sites() -> list[SiteResponse]:
         return [
-            _site_response(site, _supported_parser_or_422(state, site.base_url))
+            _site_response(site, _supported_indexer_or_422(state, site.base_url))
             for site in await state.repository.list_indexer_sites()
         ]
 
     @app.post("/api/sites/test", response_model=TestResponse)
     async def test_site(payload: SiteCreateRequest) -> TestResponse:
-        parser = _supported_parser_or_422(state, payload.base_url)
+        entry = _supported_indexer_or_422(state, payload.base_url)
+        _validate_site_credentials(payload, entry)
         proxy_url = None
         if payload.use_proxy:
             system_settings = await state.repository.get_system_settings()
             proxy_url = _proxy_url(system_settings)
-        crawler = NexusPHPCrawler(
-            NexusPHPSiteConfig(
-                name=payload.name,
-                base_url=payload.base_url,
-                cookie=payload.cookie,
-                user_agent=payload.user_agent,
-                parser=parser,
-                max_concurrency=payload.max_concurrency,
-            ),
+        test_site_payload = payload.model_dump()
+        test_site_payload["enabled"] = True
+        crawlers = build_indexers(
+            [test_site_payload],
+            state.parser_catalog,
             proxy_url=proxy_url,
         )
+        if not crawlers:
+            raise HTTPException(status_code=422, detail="无法构建当前站点适配器。")
+        crawler = crawlers[0]
         result = await crawler.test_auth()
         return TestResponse(ok=result.ok, message=result.message)
 
     @app.post("/api/sites", response_model=SiteResponse, status_code=201)
     async def create_site(payload: SiteCreateRequest) -> SiteResponse:
-        parser = _supported_parser_or_422(state, payload.base_url)
+        entry = _supported_indexer_or_422(state, payload.base_url)
+        _validate_site_credentials(payload, entry)
         try:
             site = await state.repository.create_indexer_site(**payload.model_dump())
         except IntegrityError as exc:
             raise HTTPException(status_code=409, detail="Site already exists.") from exc
         await state.reload_indexers()
-        return _site_response(site, parser)
+        return _site_response(site, entry)
 
     @app.put("/api/sites/priorities", response_model=list[SiteResponse])
     async def reorder_sites(payload: SitePriorityUpdateRequest) -> list[SiteResponse]:
@@ -1936,12 +1937,14 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         await state.reload_indexers()
         return [
-            _site_response(site, _supported_parser_or_422(state, site.base_url)) for site in sites
+            _site_response(site, _supported_indexer_or_422(state, site.base_url))
+            for site in sites
         ]
 
     @app.put("/api/sites/{site_id}", response_model=SiteResponse)
     async def update_site(site_id: str, payload: SiteCreateRequest) -> SiteResponse:
-        parser = _supported_parser_or_422(state, payload.base_url)
+        entry = _supported_indexer_or_422(state, payload.base_url)
+        _validate_site_credentials(payload, entry)
         try:
             site = await state.repository.update_indexer_site(site_id, **payload.model_dump())
         except IntegrityError as exc:
@@ -1949,7 +1952,7 @@ def create_app() -> FastAPI:
         if site is None:
             raise HTTPException(status_code=404, detail="Site not found.")
         await state.reload_indexers()
-        return _site_response(site, parser)
+        return _site_response(site, entry)
 
     @app.delete("/api/sites/{site_id}", status_code=204)
     async def delete_site(site_id: str) -> None:
@@ -4659,7 +4662,12 @@ async def _download_playlist_candidate_torrent_file(
         f"site={site.name}, title={resource.get('title') or ''}",
     )
     proxy_url = await _resolve_proxy_for_site(state, site)
-    return await _download_torrent_file(download_url, site, proxy_url=proxy_url)
+    return await _download_torrent_for_site(
+        state,
+        download_url,
+        site,
+        proxy_url=proxy_url,
+    )
 
 
 async def _scrape_playlist_candidate_items(
@@ -5325,13 +5333,39 @@ async def _submit_torrent_to_downloader(
         torrent_hash = await state.downloader.add_torrent(download_url, category=category)
         return SubmittedTorrent(torrent_hash=torrent_hash)
     proxy_url = await _resolve_proxy_for_site(state, site)
-    torrent_data = await _download_torrent_file(download_url, site, proxy_url=proxy_url)
+    torrent_data = await _download_torrent_for_site(
+        state,
+        download_url,
+        site,
+        proxy_url=proxy_url,
+    )
     torrent_hash = await state.downloader.add_torrent_file(
         torrent_data,
         filename=_torrent_filename(resource, download_url),
         category=category,
     )
     return SubmittedTorrent(torrent_hash=torrent_hash, torrent_data=torrent_data)
+
+
+async def _download_torrent_for_site(
+    state: AppState,
+    download_url: str,
+    site: IndexerSite,
+    *,
+    proxy_url: str | None,
+) -> bytes:
+    indexer = _find_indexer(state, site.id)
+    download_torrent = getattr(indexer, "download_torrent", None)
+    if callable(download_torrent):
+        torrent_data = await download_torrent(download_url)
+    else:
+        torrent_data = await _download_torrent_file(download_url, site, proxy_url=proxy_url)
+    if not _looks_like_torrent_file(torrent_data):
+        credential = "API Key/UA" if site.auth_type == "api_key" else "Cookie/UA"
+        raise RuntimeError(
+            f"下载种子文件失败：{site.name} 返回的不是 torrent 文件，请检查 {credential}。"
+        )
+    return torrent_data
 
 
 async def _match_torrent_site(
@@ -6730,6 +6764,8 @@ def _site_payload(site: IndexerSite) -> dict[str, object]:
         "name": site.name,
         "base_url": site.base_url,
         "cookie": site.cookie,
+        "auth_type": site.auth_type,
+        "api_key": site.api_key,
         "user_agent": site.user_agent,
         "priority": site.priority,
         "max_concurrency": site.max_concurrency,
@@ -9419,8 +9455,9 @@ def _format_datetime(value: datetime | None) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _site_response(site: IndexerSite, parser: NexusPHPParserConfig) -> SiteResponse:
-    return SiteResponse(**_site_payload(site), parser=_parser_response(parser))
+def _site_response(site: IndexerSite, entry: ParserCatalogEntry) -> SiteResponse:
+    parser = _parser_response(entry.parser) if entry.parser is not None else None
+    return SiteResponse(**_site_payload(site), adapter=entry.adapter, parser=parser)
 
 
 def _legacy_downloader_payload(item: dict[str, object]) -> dict[str, object]:
@@ -9480,15 +9517,38 @@ def _parser_response(parser: NexusPHPParserConfig) -> NexusPHPParserRequest:
     )
 
 
-def _supported_parser_or_422(state: AppState, base_url: str) -> NexusPHPParserConfig:
+def _supported_indexer_or_422(state: AppState, base_url: str) -> ParserCatalogEntry:
     state.reload_parser_catalog()
     entry = state.parser_catalog.match(base_url)
     if entry is None:
         raise HTTPException(
             status_code=422,
-            detail="当前站点暂不支持，请先在 sites.parser.yaml 中配置解析器。",
+            detail="当前站点暂不支持，请先在 sites.parser.yaml 中配置适配器。",
         )
+    return entry
+
+
+def _supported_parser_or_422(state: AppState, base_url: str) -> NexusPHPParserConfig:
+    entry = _supported_indexer_or_422(state, base_url)
+    if entry.parser is None:
+        raise HTTPException(status_code=422, detail="当前站点不使用 NexusPHP 解析器。")
     return entry.parser
+
+
+def _validate_site_credentials(
+    payload: SiteCreateRequest,
+    entry: ParserCatalogEntry,
+) -> None:
+    if entry.adapter == "mteam":
+        if payload.auth_type != "api_key":
+            raise HTTPException(status_code=422, detail="M-Team 站点请选择 API Key 认证。")
+        if not payload.api_key or not payload.api_key.strip():
+            raise HTTPException(status_code=422, detail="M-Team API Key 不能为空。")
+        return
+    if payload.auth_type != "cookie":
+        raise HTTPException(status_code=422, detail="当前站点仅支持 Cookie 认证。")
+    if not payload.cookie or not payload.cookie.strip():
+        raise HTTPException(status_code=422, detail="Cookie 不能为空。")
 
 
 async def _stream_temporary_file(path: Path) -> AsyncIterator[bytes]:

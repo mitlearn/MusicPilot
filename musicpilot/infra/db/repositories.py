@@ -2164,6 +2164,8 @@ class SqlAlchemyMediaRepository:
         name: str,
         base_url: str,
         cookie: str | None = None,
+        auth_type: str = "cookie",
+        api_key: str | None = None,
         user_agent: str | None = None,
         priority: int = 100,
         max_concurrency: int = 2,
@@ -2175,6 +2177,8 @@ class SqlAlchemyMediaRepository:
                 name=name,
                 base_url=base_url,
                 cookie=cookie,
+                auth_type=auth_type,
+                api_key=api_key,
                 user_agent=user_agent,
                 priority=priority,
                 max_concurrency=max_concurrency,
@@ -2193,6 +2197,8 @@ class SqlAlchemyMediaRepository:
         name: str,
         base_url: str,
         cookie: str | None = None,
+        auth_type: str = "cookie",
+        api_key: str | None = None,
         user_agent: str | None = None,
         priority: int = 100,
         max_concurrency: int = 2,
@@ -2207,6 +2213,8 @@ class SqlAlchemyMediaRepository:
             site.name = name
             site.base_url = base_url
             site.cookie = cookie
+            site.auth_type = auth_type
+            site.api_key = api_key
             site.user_agent = user_agent
             site.priority = priority
             site.max_concurrency = max_concurrency

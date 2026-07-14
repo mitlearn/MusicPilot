@@ -93,6 +93,8 @@ class Database:
                     "enabled": "BOOLEAN NOT NULL DEFAULT 1",
                     "use_proxy": "BOOLEAN NOT NULL DEFAULT 0",
                     "priority": "INTEGER NOT NULL DEFAULT 100",
+                    "auth_type": "VARCHAR(32) NOT NULL DEFAULT 'cookie'",
+                    "api_key": "TEXT",
                 },
             )
             await _add_sqlite_columns(

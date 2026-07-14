@@ -378,7 +378,10 @@ type Site = {
   name: string
   base_url: string
   cookie?: string | null
+  auth_type: 'cookie' | 'api_key'
+  api_key?: string | null
   user_agent?: string | null
+  adapter?: string
   parser?: ParserConfig
   priority: number
   max_concurrency: number
@@ -853,6 +856,8 @@ const siteForm = ref({
   name: '',
   base_url: '',
   cookie: '',
+  auth_type: 'cookie' as 'cookie' | 'api_key',
+  api_key: '',
   user_agent: '',
   priority: 100,
   max_concurrency: 2,
@@ -3336,6 +3341,8 @@ function openNewSiteDialog() {
     name: '',
     base_url: '',
     cookie: '',
+    auth_type: 'cookie',
+    api_key: '',
     user_agent: '',
     priority: 100,
     max_concurrency: 2,
@@ -3351,6 +3358,8 @@ function editSite(site: Site) {
     name: site.name,
     base_url: site.base_url,
     cookie: site.cookie ?? '',
+    auth_type: site.auth_type ?? 'cookie',
+    api_key: site.api_key ?? '',
     user_agent: site.user_agent ?? '',
     priority: site.priority,
     max_concurrency: site.max_concurrency,
@@ -6783,7 +6792,26 @@ onUnmounted(() => {
         <v-card-text class="dialog-stack">
           <v-text-field v-model="siteForm.name" label="站点名称" />
           <v-text-field v-model="siteForm.base_url" label="站点地址" />
-          <v-textarea v-model="siteForm.cookie" label="Cookie" rows="3" />
+          <v-tabs v-model="siteForm.auth_type" color="primary" grow>
+            <v-tab prepend-icon="mdi-cookie" value="cookie">Cookie</v-tab>
+            <v-tab prepend-icon="mdi-api" value="api_key">API Key</v-tab>
+          </v-tabs>
+          <v-window v-model="siteForm.auth_type">
+            <v-window-item value="cookie">
+              <v-textarea v-model="siteForm.cookie" class="mt-3" label="Cookie" rows="3" />
+            </v-window-item>
+            <v-window-item value="api_key">
+              <v-text-field
+                v-model="siteForm.api_key"
+                autocomplete="new-password"
+                class="mt-3"
+                hint="M-Team 可在用户控制面板的实验室页面获取 API Key"
+                label="API Key"
+                persistent-hint
+                type="password"
+              />
+            </v-window-item>
+          </v-window>
           <v-text-field v-model="siteForm.user_agent" label="User-Agent" />
           <v-text-field v-model.number="siteForm.priority" label="优先级（数字越小越靠前）" type="number" min="0" />
           <v-text-field v-model.number="siteForm.max_concurrency" label="最大并发" type="number" />

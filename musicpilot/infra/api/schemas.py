@@ -461,6 +461,8 @@ class SiteCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     base_url: str = Field(min_length=1)
     cookie: str | None = None
+    auth_type: str = Field(default="cookie", pattern="^(cookie|api_key)$")
+    api_key: str | None = None
     user_agent: str | None = None
     priority: int = Field(default=100, ge=0)
     max_concurrency: int = Field(default=2, ge=1, le=10)
@@ -470,7 +472,8 @@ class SiteCreateRequest(BaseModel):
 
 class SiteResponse(SiteCreateRequest):
     id: str | None = None
-    parser: NexusPHPParserRequest
+    adapter: str = "nexusphp"
+    parser: NexusPHPParserRequest | None = None
 
 
 class SitePriorityUpdateRequest(BaseModel):

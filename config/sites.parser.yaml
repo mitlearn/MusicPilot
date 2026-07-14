@@ -1,5 +1,9 @@
 sites:
   - targets:
+      - name: M-Team
+        base_url: https://kp.m-team.cc
+    adapter: mteam
+  - targets:
       - name: OpenCD
         base_url: https://open.cd
       - name: HDFans
@@ -10,6 +14,7 @@ sites:
         base_url: https://zmpt.cc/
       - name: Musopia
         base_url: https://www.musopia.vip/
+    adapter: nexusphp
     parser:
       list_selector: "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
       fields:
@@ -54,6 +59,7 @@ sites:
   - targets:
       - name: JPopSuki
         base_url: https://jpopsuki.eu/
+    adapter: nexusphp
     parser:
       search_path: ajax.php
       search_query_param: searchstr
@@ -109,6 +115,7 @@ sites:
         base_url: https://hhan.club/
       - name: HHClub
         base_url: https://hhanclub.top/
+    adapter: nexusphp
     parser:
       search_params:
         search-mode: "0"

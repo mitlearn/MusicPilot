@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import yaml
 
+from musicpilot.adapters.indexers.mteam import MTeamCrawler, MTeamSiteConfig
 from musicpilot.adapters.indexers.nexusphp import (
     FieldRule,
     NexusPHPCrawler,
@@ -14,13 +15,15 @@ from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPSiteConfig,
     ResultFilterRule,
 )
+from musicpilot.ports.indexer import Indexer
 
 
 @dataclass(frozen=True, slots=True)
 class ParserCatalogEntry:
     name: str
     base_url: str
-    parser: NexusPHPParserConfig
+    adapter: str
+    parser: NexusPHPParserConfig | None = None
 
 
 class ParserCatalog:
@@ -60,13 +63,19 @@ def _load_parser_catalog_entries(path: Path) -> tuple[ParserCatalogEntry, ...]:
     for site in sites:
         if not isinstance(site, dict):
             raise ValueError(f"Invalid parser site entry in {path}: expected mapping")
-        parser = parser_config_from_mapping(site.get("parser"))
+        adapter = str(site.get("adapter", "nexusphp")).strip().lower()
+        if adapter not in {"nexusphp", "mteam"}:
+            raise ValueError(f"Unsupported indexer adapter {adapter!r} in {path}")
+        parser = (
+            parser_config_from_mapping(site.get("parser")) if adapter == "nexusphp" else None
+        )
         try:
             for target in _parser_site_targets(site, path):
                 entries.append(
                     ParserCatalogEntry(
                         name=str(target["name"]),
                         base_url=str(target["base_url"]),
+                        adapter=adapter,
                         parser=parser,
                     )
                 )
@@ -93,12 +102,12 @@ def _parser_site_targets(site: dict[str, Any], path: Path) -> tuple[dict[str, An
     return tuple(parsed_targets)
 
 
-def build_nexusphp_indexers(
+def build_indexers(
     sites: list[dict[str, Any]],
     catalog: ParserCatalog,
     proxy_url: str | None = None,
-) -> tuple[NexusPHPCrawler, ...]:
-    crawlers: list[NexusPHPCrawler] = []
+) -> tuple[Indexer, ...]:
+    crawlers: list[Indexer] = []
     for site in sites:
         if not bool(site.get("enabled", True)):
             continue
@@ -106,18 +115,34 @@ def build_nexusphp_indexers(
         if entry is None:
             continue
         use_proxy = bool(site.get("use_proxy", False))
-        crawlers.append(
-            NexusPHPCrawler(
-                _site_config(site, entry),
-                proxy_url=proxy_url if use_proxy else None,
+        site_proxy_url = proxy_url if use_proxy else None
+        if entry.adapter == "mteam":
+            crawlers.append(
+                MTeamCrawler(
+                    _mteam_site_config(site),
+                    proxy_url=site_proxy_url,
+                )
             )
+            continue
+        crawlers.append(
+            NexusPHPCrawler(_site_config(site, entry), proxy_url=site_proxy_url)
         )
     return tuple(crawlers)
+
+
+def build_nexusphp_indexers(
+    sites: list[dict[str, Any]],
+    catalog: ParserCatalog,
+    proxy_url: str | None = None,
+) -> tuple[Indexer, ...]:
+    return build_indexers(sites, catalog, proxy_url)
 
 
 def _site_config(raw: Any, entry: ParserCatalogEntry) -> NexusPHPSiteConfig:
     if not isinstance(raw, dict):
         raise ValueError("Invalid site entry: expected mapping")
+    if entry.parser is None:
+        raise ValueError(f"NexusPHP parser is required for {entry.name}")
     try:
         return NexusPHPSiteConfig(
             name=str(raw["name"]),
@@ -125,6 +150,22 @@ def _site_config(raw: Any, entry: ParserCatalogEntry) -> NexusPHPSiteConfig:
             cookie=str(raw["cookie"]) if raw.get("cookie") else None,
             site_id=str(raw["id"]) if raw.get("id") else None,
             parser=entry.parser,
+            max_concurrency=int(raw.get("max_concurrency", 2)),
+            user_agent=str(raw["user_agent"]) if raw.get("user_agent") else None,
+        )
+    except KeyError as exc:
+        raise ValueError(f"Missing required site config key {exc.args[0]!r}") from exc
+
+
+def _mteam_site_config(raw: Any) -> MTeamSiteConfig:
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid site entry: expected mapping")
+    try:
+        return MTeamSiteConfig(
+            name=str(raw["name"]),
+            base_url=str(raw["base_url"]),
+            api_key=str(raw["api_key"]).strip() if raw.get("api_key") else None,
+            site_id=str(raw["id"]) if raw.get("id") else None,
             max_concurrency=int(raw.get("max_concurrency", 2)),
             user_agent=str(raw["user_agent"]) if raw.get("user_agent") else None,
         )

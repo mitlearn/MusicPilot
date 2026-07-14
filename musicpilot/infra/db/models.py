@@ -225,6 +225,8 @@ class IndexerSite(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(128))
     base_url: Mapped[str] = mapped_column(Text, unique=True)
     cookie: Mapped[str | None] = mapped_column(Text, nullable=True)
+    auth_type: Mapped[str] = mapped_column(String(32), default="cookie")
+    api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     priority: Mapped[int] = mapped_column(Integer, default=100)
     max_concurrency: Mapped[int] = mapped_column(Integer, default=2)
