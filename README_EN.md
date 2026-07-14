@@ -12,6 +12,8 @@ MusicPilot is a self-hosted music library automation tool that turns music disco
 
 It is designed for users who already run their own music library, downloader, and resource sites. MusicPilot does not replace those systems and does not provide download channels. Instead, it connects existing services and reduces repeated manual work around searching, downloading, organizing files, and refreshing the music library.
 
+Telegram notification channel: [https://telegram.me/musicpilot_channel](https://telegram.me/musicpilot_channel)
+
 Core goals:
 
 1. Provide one Web UI for managing music search, downloads, organization, playlists, and music library status.

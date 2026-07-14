@@ -12,6 +12,8 @@ MusicPilot 是一个面向自托管用户的音乐库自动化工具，用来把
 
 它适合已经搭建好音乐库、下载器和资源站点的用户：MusicPilot 不替代这些系统，也不提供下载渠道，而是负责把已有服务连接起来，减少重复搜索、手动下载、手动整理和手动刷新音乐库的操作。
 
+Telegram 通知频道：[https://telegram.me/musicpilot_channel](https://telegram.me/musicpilot_channel)
+
 项目的核心目标：
 
 1. 用一个 Web 界面管理音乐搜索、下载、整理、歌单和音乐库状态。

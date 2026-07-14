@@ -6237,7 +6237,7 @@ onUnmounted(() => {
                       </div>
                       <div class="about-info-row">
                         <span>发布频道</span>
-                        <a href="https://t.me/musicpilot_channel" rel="noreferrer" target="_blank">
+                        <a href="https://telegram.me/musicpilot_channel" rel="noreferrer" target="_blank">
                           @musicpilot_channel
                         </a>
                       </div>
